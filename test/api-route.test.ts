@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
+import { afterEach, describe, expect, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../src/index.ts'
 
 const ID = '2de8b71d-bd3b-4f4d-8d1d-5dceac76f934'
@@ -34,33 +34,108 @@ function browserRequest(body: unknown, headers: Record<string, string>): Request
   })
 }
 
-function installPlugin(): { routes: RegisteredRoute[]; deleted: string[] } {
+/**
+ * The host services as this host actually exposes them, measured against the
+ * harness source (packages/session/session-persistence-jsonl: create/open/
+ * flush/stat/list only; packages/core/session SessionStore: get/list/
+ * flush(Session); packages/core/agent AgentRegistry: get/list). None of them
+ * carry the deletion primitives the scaffold's capability layer documents, so a
+ * request against these shapes must fail closed with
+ * `runtime-capability-missing`, never with `unexpected-error`.
+ */
+function hostShapes(): Record<string, object> {
+  return {
+    agents: { get: () => undefined, list: () => [] },
+    sessions: { get: () => undefined, list: () => [], flush: async () => true },
+    sessionPersistence: {
+      create: async () => ({}),
+      open: async () => ({}),
+      flush: async () => {},
+      stat: async () => undefined,
+      list: async () => [],
+    },
+    sessionProjectionCache: { write: async () => {} },
+    workspaceRegistry: { list: () => [], archivedSessionIds: [], pinnedSessionIds: [] },
+  }
+}
+
+interface Harness {
+  routes: RegisteredRoute[]
+  deleted: string[]
+  logs: string[]
+  dispose(): Promise<void>
+}
+
+/**
+ * A REAL cordis topology, not a plain-object fixture. The bug this suite locks
+ * out only exists against a real Context proxy: reading a service the plugin
+ * did not inject throws a plain `Error('cannot get property "<name>" without
+ * inject')`, which the old fixture could never produce because its property
+ * reads simply worked. The host fiber provides `tools`/`connection` plus the
+ * given optional services; the plugin fiber then loads `apply` exactly the way
+ * the host loads plugins. `ctx.inject` captures fire synchronously during
+ * `apply` when the service already exists (measured), so requests issued after
+ * this helper resolves see a fully captured resolver.
+ */
+async function install(services?: Record<string, object>): Promise<Harness> {
   const routes: RegisteredRoute[] = []
   const deleted: string[] = []
-  const ctx = {
-    tools: { register: () => {} },
-    // Services the runtime adapter capability-detects. Absent agents/live sessions
-    // make the orchestration fall through to persistence + cleanup, so a request
-    // that clears the gate can be observed end to end.
-    agents: { get: () => undefined },
-    sessions: { get: () => undefined },
+  const logs: string[] = []
+  const root = new Context()
+  const logger = root.logger as unknown as { error: (...args: unknown[]) => void }
+  const originalError = logger.error.bind(root.logger)
+  logger.error = (...args: unknown[]) => {
+    logs.push(args.map(arg => (typeof arg === 'string' ? arg : String(arg))).join(' '))
+  }
+  const host = root.plugin({
+    name: 'test-host',
+    apply(c) {
+      c.reflect.provide('tools', { register: () => {} })
+      c.reflect.provide('connection', {
+        fetch: {
+          register: (route: RegisteredRoute) => {
+            routes.push(route)
+            return () => {}
+          },
+        },
+      })
+      for (const [name, value] of Object.entries(services ?? {})) {
+        c.reflect.provide(name, value)
+      }
+    },
+  })
+  await host
+  const plugin = root.plugin({
+    name: 'session-purge',
+    inject: ['tools', 'connection'],
+    apply,
+  })
+  await plugin
+  return {
+    routes,
+    deleted,
+    logs,
+    dispose: async () => {
+      logger.error = originalError
+      // The root Context exposes no dispose on this cordis version; the fibers do.
+      await plugin.dispose()
+      await host.dispose()
+    },
+  }
+}
+
+/** Success-capable persistence: the host primitive this scaffold documents. */
+function deleteCapablePersistence(deleted: string[]): Record<string, object> {
+  return {
+    agents: { get: () => undefined, list: () => [] },
+    sessions: { get: () => undefined, list: () => [], flush: async () => true },
     sessionPersistence: {
       delete: async (id: string) => { deleted.push(id) },
-      listSync: () => [],
+      listSync: () => [] as readonly { id?: string }[],
     },
     sessionProjectionCache: { purge: async () => true },
     workspaceRegistry: { releaseSession: async () => {} },
-    connection: {
-      fetch: {
-        register: (route: RegisteredRoute) => {
-          routes.push(route)
-          return () => {}
-        },
-      },
-    },
   }
-  apply(ctx as unknown as Context)
-  return { routes, deleted }
 }
 
 async function post(route: RegisteredRoute, body: unknown, headers: Record<string, string>) {
@@ -68,9 +143,22 @@ async function post(route: RegisteredRoute, body: unknown, headers: Record<strin
   return { status: response.status, payload: await response.json() as { ok?: boolean; error?: string; stage?: string } }
 }
 
+let active: Harness[] = []
+
+afterEach(async () => {
+  for (const harness of active) await harness.dispose()
+  active = []
+})
+
+async function opened(services?: Record<string, object>): Promise<Harness> {
+  const harness = await install(services)
+  active.push(harness)
+  return harness
+}
+
 describe('POST /api/session-purge/delete origin gate', () => {
-  it('registers the delete route for POST only', () => {
-    const { routes } = installPlugin()
+  it('registers the delete route for POST only', async () => {
+    const { routes } = await opened(deleteCapablePersistence([]))
     expect(routes.map(route => route.path)).toEqual([PATH])
     expect([...routes[0].methods]).toEqual(['POST'])
   })
@@ -79,7 +167,8 @@ describe('POST /api/session-purge/delete origin gate', () => {
   // and was answered 403 cross-origin-request-rejected, so deletion was unusable
   // from the browser while the identical request without Origin succeeded.
   it('admits a same-origin browser POST and completes the purge', async () => {
-    const { routes, deleted } = installPlugin()
+    const deleted: string[] = []
+    const { routes } = await opened(deleteCapablePersistence(deleted))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
       host: '127.0.0.1:13080',
       origin: 'http://127.0.0.1:13080',
@@ -90,7 +179,8 @@ describe('POST /api/session-purge/delete origin gate', () => {
   })
 
   it('admits a request with no Origin header (non-browser clients reach the host fence instead)', async () => {
-    const { routes, deleted } = installPlugin()
+    const deleted: string[] = []
+    const { routes } = await opened(deleteCapablePersistence(deleted))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, { host: '127.0.0.1:13080' })
     expect(status).toBe(200)
     expect(payload.ok).toBe(true)
@@ -98,7 +188,6 @@ describe('POST /api/session-purge/delete origin gate', () => {
   })
 
   it('matches authorities through URL normalization, not raw strings', async () => {
-    const { routes } = installPlugin()
     // Case and a redundant default port must not decide the verdict: the host's own
     // fence normalizes both sides through WHATWG, and a browser may spell the page
     // authority differently from the Host header it dialed.
@@ -107,6 +196,7 @@ describe('POST /api/session-purge/delete origin gate', () => {
       ['Example.COM', 'http://example.com'],
       ['example.com:80', 'http://example.com'],
     ] as const) {
+      const { routes } = await opened(deleteCapablePersistence([]))
       const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, { host, origin })
       expect({ host, origin, status }).toEqual({ host, origin, status: 200 })
       expect(payload.ok).toBe(true)
@@ -114,11 +204,11 @@ describe('POST /api/session-purge/delete origin gate', () => {
   })
 
   it('ignores the scheme, matching the host fence for TLS-terminating proxies', async () => {
-    const { routes } = installPlugin()
     // Behind a TLS-terminating proxy the page origin is `https:` while the Host
     // header it forwards carries no scheme at all. The host's own /api fence
     // compares hosts only (api-request-trust.ts) and admits this pair, so a
     // stricter comparison here would break that legitimate deployment.
+    const { routes } = await opened(deleteCapablePersistence([]))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
       host: 'dsg.example.com',
       origin: 'https://dsg.example.com',
@@ -128,7 +218,8 @@ describe('POST /api/session-purge/delete origin gate', () => {
   })
 
   it('rejects a foreign origin and deletes nothing', async () => {
-    const { routes, deleted } = installPlugin()
+    const deleted: string[] = []
+    const { routes } = await opened(deleteCapablePersistence(deleted))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
       host: '127.0.0.1:13080',
       origin: 'http://evil.example',
@@ -139,29 +230,27 @@ describe('POST /api/session-purge/delete origin gate', () => {
   })
 
   it('rejects the same hostname on a different port', async () => {
-    const { routes, deleted } = installPlugin()
+    const { routes } = await opened(deleteCapablePersistence([]))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
       host: '127.0.0.1:13080',
       origin: 'http://127.0.0.1:9999',
     })
     expect(status).toBe(403)
     expect(payload.error).toBe('cross-origin-request-rejected')
-    expect(deleted).toEqual([])
   })
 
   it('rejects an unparsable origin', async () => {
-    const { routes, deleted } = installPlugin()
+    const { routes } = await opened(deleteCapablePersistence([]))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
       host: '127.0.0.1:13080',
       origin: 'not-a-url',
     })
     expect(status).toBe(403)
     expect(payload.error).toBe('invalid-origin')
-    expect(deleted).toEqual([])
   })
 
   it('fails closed when the Host header is missing', async () => {
-    const { routes, deleted } = installPlugin()
+    const { routes } = await opened(deleteCapablePersistence([]))
     const request = new Request(bridgeUrl(), {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: 'http://127.0.0.1:13080' },
@@ -173,17 +262,70 @@ describe('POST /api/session-purge/delete origin gate', () => {
     expect(request.headers.get('host')).toBeNull()
     const response = await routes[0].fetch(request)
     expect(response.status).toBe(403)
-    expect(deleted).toEqual([])
   })
 
   it('still reaches the confirm gate behind the origin gate', async () => {
-    const { routes, deleted } = installPlugin()
+    const { routes } = await opened(deleteCapablePersistence([]))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: false }, {
       host: '127.0.0.1:13080',
       origin: 'http://127.0.0.1:13080',
     })
     expect(status).toBe(400)
     expect(payload.error).toBe('sessionId-and-confirm-true-required')
+  })
+})
+
+describe('host capability detection on a real cordis context', () => {
+  // The reported failure: every browser delete answered
+  // `unexpected-error: operation failed; inspect host logs for details.`
+  // because the adapter read host services it never injected, and cordis
+  // throws a plain Error for those reads. The capability layer must answer
+  // with its own diagnostic instead, and never that opaque string.
+  it('fails closed with runtime-capability-missing when the host has no delete primitive', async () => {
+    const { routes, deleted, logs } = await opened(hostShapes())
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(501)
+    expect(payload.ok).toBe(false)
+    expect(payload.stage).toBe('delete-log')
+    expect(payload.error).toContain('runtime-capability-missing')
+    expect(payload.error).toContain('sessionPersistence.delete')
+    expect(payload.error).not.toContain('unexpected-error')
+    expect(deleted).toEqual([])
+    expect(logs).toEqual([])
+  })
+
+  it('fails closed with runtime-capability-missing when the host provides no optional services at all', async () => {
+    const { routes, logs } = await opened()
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(501)
+    expect(payload.stage).toBe('stop-agent')
+    expect(payload.error).toContain('agents registry is unavailable')
+    expect(payload.error).not.toContain('unexpected-error')
+    expect(logs).toEqual([])
+  })
+
+  it('answers with the sanitized message but writes the raw cause to the host log', async () => {
+    const deleted: string[] = []
+    const services = deleteCapablePersistence(deleted)
+    ;(services.sessionPersistence as { delete: (id: string) => Promise<void> }).delete = async () => {
+      throw new Error('jsonl artifact locked by another process')
+    }
+    const { routes, logs } = await opened(services)
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(500)
+    expect(payload.error).toBe('unexpected-error: operation failed; inspect host logs for details.')
+    // The public advice is only honest if the raw cause really reached the log.
+    expect(logs.some(line => line.includes('session-purge: unexpected failure at delete-log'))).toBe(true)
+    expect(logs.some(line => line.includes('jsonl artifact locked by another process'))).toBe(true)
     expect(deleted).toEqual([])
   })
 })

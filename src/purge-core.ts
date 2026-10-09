@@ -79,11 +79,16 @@ function messageOf(error: unknown): string {
  * Ordering invariant:
  * stop/drain -> flush -> detach -> delete -> verify absence -> purge cache -> release workspace ledger.
  * Once the log is deleted, cache and ledger cleanup are both attempted even if one fails.
+ *
+ * `onUnexpectedError` receives every raw exception that the public `error` string
+ * sanitizes away, so the host layer can write the real cause to its log; this
+ * module itself stays runtime-agnostic and never reads host services directly.
  */
 export async function purgeSession(
   runtime: SessionPurgeRuntime,
   rawId: string,
   signal?: AbortSignal,
+  onUnexpectedError?: (error: unknown, stage: PurgeStage) => void,
 ): Promise<PurgeResult> {
   let id = ''
   let stage: PurgeStage = 'validate'
@@ -128,6 +133,7 @@ export async function purgeSession(
     try {
       result.cache = await runtime.purgeProjectionCache(id)
     } catch (error) {
+      if (!(error instanceof SessionPurgeError)) onUnexpectedError?.(error, stage)
       result.error = `cache-cleanup-failed: ${messageOf(error)}`
     }
 
@@ -136,6 +142,7 @@ export async function purgeSession(
       await runtime.releaseWorkspaceMembership(id)
       result.ledger = true
     } catch (error) {
+      if (!(error instanceof SessionPurgeError)) onUnexpectedError?.(error, stage)
       const ledgerError = `ledger-cleanup-failed: ${messageOf(error)}`
       result.error = result.error ? `${result.error}; ${ledgerError}` : ledgerError
     }
@@ -147,6 +154,7 @@ export async function purgeSession(
     }
     return result
   } catch (error) {
+    if (!(error instanceof SessionPurgeError)) onUnexpectedError?.(error, stage)
     result.id = id
     result.stage = stage
     result.error = messageOf(error)

@@ -1,10 +1,11 @@
-import type { Context } from '@deepseek-ai/cordis'
 import {
   SessionPurgeError,
   type SessionPurgeRuntime,
 } from './purge-core.ts'
 
-/** Structural view of the optional services available in compatible DSH forks. */
+/**
+ * Structural view of the optional services available in compatible DSH forks.
+ */
 interface LooseService {
   get?: (id: string) => unknown
   flush?: (id: string, signal?: AbortSignal) => Promise<unknown>
@@ -17,10 +18,18 @@ interface LooseService {
   detachSession?: (id: string) => Promise<unknown> | unknown
 }
 
-function service(ctx: Context, name: string): LooseService | undefined {
-  const value = Reflect.get(ctx, name) as unknown
-  return value && typeof value === 'object' ? value as LooseService : undefined
-}
+/**
+ * Service lookup for the adapter. The host context must NEVER be read with a
+ * bare property access for a service this plugin does not statically inject:
+ * on a real cordis Context (measured with cordis 4.0.1 on this host) the proxy
+ * trap throws a plain `Error('cannot get property "<name>" without inject')`
+ * for every undeclared name, which the purge's sanitizer would then flatten
+ * into `unexpected-error: operation failed; ...`. The resolver is fed by
+ * `ctx.inject([name], ...)` captures in `apply()`, which fire when a service
+ * appears and simply never fire on hosts that lack it, so the capability
+ * detection below stays authoritative.
+ */
+export type ServiceResolver = (name: string) => LooseService | undefined
 
 function needMethod<T extends (...args: never[]) => unknown>(
   object: object | undefined,
@@ -42,11 +51,11 @@ function needMethod<T extends (...args: never[]) => unknown>(
  * Build an adapter only from explicit host capabilities. Missing critical methods
  * fail closed; this code intentionally does not unlink guessed filesystem paths.
  */
-export function createRuntimeAdapter(ctx: Context): SessionPurgeRuntime {
+export function createRuntimeAdapter(resolve: ServiceResolver): SessionPurgeRuntime {
   return {
     async stopAndDrainAgent(id, signal) {
       signal?.throwIfAborted()
-      const agents = service(ctx, 'agents')
+      const agents = resolve('agents')
       if (!agents || typeof agents.get !== 'function') {
         throw new SessionPurgeError(
           'runtime-capability-missing',
@@ -75,8 +84,8 @@ export function createRuntimeAdapter(ctx: Context): SessionPurgeRuntime {
 
     async flushSession(id, signal) {
       signal?.throwIfAborted()
-      const sessions = service(ctx, 'sessions')
-      const persistence = service(ctx, 'sessionPersistence')
+      const sessions = resolve('sessions')
+      const persistence = resolve('sessionPersistence')
       if (!sessions || typeof sessions.get !== 'function') {
         throw new SessionPurgeError(
           'runtime-capability-missing',
@@ -98,7 +107,7 @@ export function createRuntimeAdapter(ctx: Context): SessionPurgeRuntime {
     },
 
     async detachSession(id) {
-      const sessions = service(ctx, 'sessions')
+      const sessions = resolve('sessions')
       if (!sessions || typeof sessions.get !== 'function') {
         throw new SessionPurgeError(
           'runtime-capability-missing',
@@ -123,7 +132,7 @@ export function createRuntimeAdapter(ctx: Context): SessionPurgeRuntime {
     },
 
     async deleteLog(id, signal) {
-      const persistence = service(ctx, 'sessionPersistence')
+      const persistence = resolve('sessionPersistence')
       const remove = needMethod<(id: string, signal?: AbortSignal) => Promise<unknown>>(
         persistence,
         'delete',
@@ -133,7 +142,7 @@ export function createRuntimeAdapter(ctx: Context): SessionPurgeRuntime {
     },
 
     async logIsAbsent(id) {
-      const persistence = service(ctx, 'sessionPersistence')
+      const persistence = resolve('sessionPersistence')
       if (!persistence) {
         throw new SessionPurgeError(
           'runtime-capability-missing',
@@ -152,7 +161,7 @@ export function createRuntimeAdapter(ctx: Context): SessionPurgeRuntime {
     },
 
     async purgeProjectionCache(id) {
-      const projectionCache = service(ctx, 'sessionProjectionCache')
+      const projectionCache = resolve('sessionProjectionCache')
       const purge = needMethod<(id: string) => Promise<boolean>>(
         projectionCache,
         'purge',
@@ -162,7 +171,7 @@ export function createRuntimeAdapter(ctx: Context): SessionPurgeRuntime {
     },
 
     async releaseWorkspaceMembership(id) {
-      const workspaceRegistry = service(ctx, 'workspaceRegistry')
+      const workspaceRegistry = resolve('workspaceRegistry')
       const method = typeof workspaceRegistry?.releaseSession === 'function'
         ? workspaceRegistry.releaseSession
         : workspaceRegistry?.detachSession

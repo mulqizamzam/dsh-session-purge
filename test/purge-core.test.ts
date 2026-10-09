@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { normalizeSessionId, purgeSession, type SessionPurgeRuntime } from '../src/purge-core.ts'
+import { normalizeSessionId, purgeSession, SessionPurgeError, type SessionPurgeRuntime } from '../src/purge-core.ts'
 
 const ID = '2de8b71d-bd3b-4f4d-8d1d-5dceac76f934'
 
@@ -70,5 +70,26 @@ describe('purgeSession', () => {
     const { runtime: adapter } = runtime({ stopAndDrainAgent: stop })
     await purgeSession(adapter, ID, controller.signal)
     expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('hands the raw exception of a sanitized failure to the observer', async () => {
+    const raw = new Error('jsonl artifact locked by another process')
+    const { runtime: adapter } = runtime({ stopAndDrainAgent: async () => { throw raw } })
+    const observed: { message: string; stage: string }[] = []
+    const result = await purgeSession(adapter, ID, undefined, (error, stage) => {
+      observed.push({ message: error instanceof Error ? error.message : String(error), stage })
+    })
+    expect(result.error).toBe('unexpected-error: operation failed; inspect host logs for details.')
+    // The public string hides the cause, so the observer must carry it instead.
+    expect(observed).toEqual([{ message: 'jsonl artifact locked by another process', stage: 'stop-agent' }])
+  })
+
+  it('does not hand typed SessionPurgeErrors to the observer', async () => {
+    // A typed failure already carries its full diagnostic in the public message.
+    const { runtime: adapter } = runtime({ deleteLog: async () => { throw new SessionPurgeError('runtime-capability-missing', 'delete-log', 'no delete primitive') } })
+    const observed: unknown[] = []
+    const result = await purgeSession(adapter, ID, undefined, error => { observed.push(error) })
+    expect(result.error).toBe('runtime-capability-missing: no delete primitive')
+    expect(observed).toEqual([])
   })
 })

@@ -1,12 +1,41 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { purgeSession, type PurgeResult } from './purge-core.ts'
-import { createRuntimeAdapter, publicErrorMessage } from './runtime-adapter.ts'
+import {
+  createRuntimeAdapter,
+  publicErrorMessage,
+  type ServiceResolver,
+} from './runtime-adapter.ts'
 
 export const name = 'session-purge'
 export const inject = ['tools', 'connection']
 
 const DELETE_PATH = '/api/session-purge/delete'
+
+/**
+ * Host services the adapter capability-detects. They are captured through
+ * `ctx.inject([name], ...)` instead of static `inject` or direct property
+ * reads, for two measured reasons on this host (cordis 4.0.1):
+ * - a static inject for a service a host never provides leaves the fiber
+ *   epoch INACTIVE, so this plugin's body never runs at all, silently;
+ * - a direct property read of an undeclared service throws a plain Error,
+ *   which the purge sanitizer would flatten into an opaque
+ *   `unexpected-error: operation failed; ...`.
+ * The callback fires when the service appears and never fires when the host
+ * lacks it, so capability detection stays authoritative and boot never blocks.
+ */
+const OPTIONAL_SERVICES = [
+  'agents',
+  'sessions',
+  'sessionPersistence',
+  'sessionProjectionCache',
+  'workspaceRegistry',
+] as const
+
+function logUnexpected(ctx: Context, error: unknown, stage: string): void {
+  const detail = error instanceof Error ? (error.stack || error.message) : String(error)
+  ctx.logger?.error?.(`session-purge: unexpected failure at ${stage}: ${detail}`)
+}
 
 interface FetchRoute {
   path: string
@@ -58,7 +87,15 @@ function resultStatus(result: PurgeResult): number {
 }
 
 export function apply(ctx: Context): void {
-  const runtime = createRuntimeAdapter(ctx)
+  const resolved = new Map<string, object>()
+  for (const name of OPTIONAL_SERVICES) {
+    ctx.inject([name], (injected: Context) => {
+      const value = Reflect.get(injected, name) as unknown
+      if (value && typeof value === 'object') resolved.set(name, value)
+    })
+  }
+  const resolve: ServiceResolver = name => resolved.get(name) as ReturnType<ServiceResolver>
+  const runtime = createRuntimeAdapter(resolve)
 
   ctx.tools.register(defineTool({
     name: 'session_purge',
@@ -144,9 +181,12 @@ export function apply(ctx: Context): void {
         return json({ ok: false, error: 'sessionId-and-confirm-true-required' }, 400)
       }
       try {
-        const result = await purgeSession(runtime, input.sessionId, request.signal)
+        const result = await purgeSession(runtime, input.sessionId, request.signal, (error, stage) => {
+          logUnexpected(ctx, error, stage)
+        })
         return json(result, resultStatus(result))
       } catch (error) {
+        logUnexpected(ctx, error, 'route')
         return json({ ok: false, error: publicErrorMessage(error) }, 500)
       }
     },

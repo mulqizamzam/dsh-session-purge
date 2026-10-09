@@ -55,6 +55,7 @@ looks like this:
 | Client bundle built as one classic script wrapped in `window.__ModuleLoader__.load({ id, factory })` (`tsdown.config.ts`) | The web module table executes plugin client bundles as classic scripts. ESM output is a syntax error there, and bundling React ships a second React copy | `lib/client.js` before/after: 77.81 kB with bundled React down to 9.52 kB with `require("react")` |
 | Row wrapped in `- insert:` (`cordis.patch.yml`) | A bundle patch is an operation list, not an entry list. A bare row is read as a non-insert patch, prints `patch: entry "session-purge" not found`, and mounts nothing | that exact warning appeared in `dsh --profile <name> --dump-config` before the fix |
 | Type-only import of `@deepseek-ai/dsh-client-ui-session/client` (`src/client/index.tsx`) | That package merges `SessionStandardProps`, which declares `sessionId: SessionId`, into the slot props. Without it the header slot has no session id | TS2339 before the fix |
+| Optional host services captured through `ctx.inject([name], ...)` instead of static `inject` or direct property reads (`src/index.ts`, `src/runtime-adapter.ts`) | Two measured failure modes on cordis 4.0.1: a static inject for a service the host never provides leaves the fiber epoch INACTIVE, so `apply` never runs and the plugin dies silently; a direct property read of an undeclared service throws a plain `Error('cannot get property "<name>" without inject')`, which the purge sanitizer flattened into `unexpected-error: operation failed; ...` for every delete attempt | Reproduction against a real cordis Context with the host-shaped services: HTTP 500 at stage `stop-agent` before the fix, HTTP 501 at stage `delete-log` after it; both are locked by `test/api-route.test.ts` |
 
 `package.json` pins eleven `@deepseek-ai/*` packages as devDependencies. The host
 delivers those packages at run time, but a `link:`-installed plugin resolves its own
@@ -68,7 +69,7 @@ what your host actually runs (see Prerequisites).
 | Requirement | How to check | Notes |
 |---|---|---|
 | A DSH host and a profile you control | `dsh --help` prints the usage line | Profiles live under `$DSH_HOME/profiles/<name>` (from the same help text) |
-| Node.js | `node --version` | `package.json` declares **no `engines` field**: Perlu dikonfirmasi for a hard minimum. This checkout was built and tested on `v24.19.0`. |
+| Node.js | `node --version` | `package.json` declares **no `engines` field**, so no hard minimum is pinned. This checkout was built and tested on `v24.19.0`. |
 | npm | `npm --version` | This checkout carries `package-lock.json`, which settles npm as its package manager. Verified with `11.17.0`. |
 | Network access to an npm registry that publishes `@deepseek-ai/*` | `npm view @deepseek-ai/dsh-tools version` | Verified against `registry.npmjs.org` while preparing this package (run here with the selector `@0.2.0-rc.2`) |
 | Your host's DSH runtime version | `pnpm why @deepseek-ai/dsh-tools` inside `$DSH_HOME/profiles/<name>` | `0.2.0-rc.2` in the checkout this README was written for. The plugin's peers are all `"*"`, so the host's version gate passes anywhere and cannot tell you whether the host is compatible. |
@@ -139,7 +140,7 @@ exits 0 and the composed tree contains
 ```
 
 No port belongs to this package. The GUI URL is owned by the host's configuration,
-not by this repository: Perlu dikonfirmasi for your own host.
+not by this repository; check your own host's profile.
 
 ## First Use / Quick Start
 
@@ -156,7 +157,15 @@ One worked example, from install to the expected outcome.
 4. On a stock host the dialog then shows
    `Deletion failed: runtime-capability-missing: ...` and **no file is deleted**.
    That is the expected, fail-closed outcome until the host ships the integration
-   in `integration/README.md`.
+   in `integration/README.md`. Measured against DSH `0.2.0-rc.2` (the host this
+   checkout was verified on): `SessionPersistence` exposes `create`/`open`/
+   `flush`/`stat`/`list` and **no `delete`**, `SessionStore` has no `detach`,
+   `SessionProjectionCache` has no `purge`, and the workspace registry exposes
+   neither `releaseSession` nor `detachSession` — so rc.2 *is* a stock host for
+   this contract, and HTTP 501 at stage `delete-log` is the live outcome there.
+   The dialog must not show `unexpected-error: operation failed; ...` for that
+   case; if it does, the host log line tagged
+   `session-purge: unexpected failure at <stage>` names the real cause.
 5. On an integrated host the list refreshes in place, the dialog closes, and the
    session is gone after the seven steps of the cleanup contract.
 
@@ -242,29 +251,38 @@ dsh plugin --profile <name> remove dsh-session-purge
 
 ## Testing
 
-Runner: vitest, invoked as `npm test`. There is no `vitest.config.*` file, so vitest's
-defaults pick up `test/purge-core.test.ts`.
+Runner: vitest, invoked as `npm test`. There is no `vitest.config.*` file, so
+vitest's defaults pick up both files under `test/`.
 
-The suite is pure host-logic: it drives `purgeSession` against a fake
-`SessionPurgeRuntime` and asserts ordering, failure paths, and signal propagation.
+Two layers:
+
+- `test/purge-core.test.ts` drives `purgeSession` against a fake
+  `SessionPurgeRuntime` and asserts ordering, failure paths, signal
+  propagation, and what the raw-error observer receives.
+- `test/api-route.test.ts` loads the plugin through a **real cordis Context**
+  (a host fiber provides `tools`/`connection` plus host-shaped services; the
+  plugin fiber then runs `apply`, exactly as the host loads plugins). A
+  plain-object ctx fixture used to hide the inject bug this package shipped
+  with, because its property reads never threw; the topology fixture cannot.
+  The host shapes mirror the measured `0.2.0-rc.2` services, so the capability
+  detection is asserted against what this host actually exposes.
 
 What success looks like (observed):
 
 ```text
-✓ test/purge-core.test.ts (7 tests) 12ms
+ ✓ test/purge-core.test.ts (9 tests) 9ms
+ ✓ test/api-route.test.ts (13 tests) 103ms
 
-Test Files  1 passed (1)
-     Tests  7 passed (7)
+ Test Files  2 passed (2)
+      Tests  22 passed (22)
 ```
 
 Exit code 0 on pass (observed). A failing assertion is reported per test by vitest
 and the process exits non-zero; that path was not reproduced in this checkout,
 because the suite passes.
 
-Two test types exist: ordering/failure-path unit tests here, plus the browser-slot
-and endpoint behavior which is only exercised against a running host. There is no
-test for client bundle loading inside this package: Perlu dikonfirmasi, it would
-require the host's module table.
+Only the browser slot, the client bundle loading inside the host's module table,
+and the live host transport remain untested here; they need a running profile.
 
 npm 11 may print `npm warn allow-scripts ... esbuild@0.28.2 (postinstall: node install.js)`
 during `npm install`. Observed in this checkout, and the test suite still passed.
@@ -283,6 +301,7 @@ loads it.
 | The 🗑 button never appears | Profile not restarted since install, client bundle missing, or a profile without a web surface | `dsh --profile <name> --dump-config` for the row, `ls lib/client.js` for the bundle | Build, restart; the buttons only exist in the `web` platform half |
 | `require("...") missed the module table` in the browser console | The client bundle asked for something outside the platform seed words | Compare `CLIENT_SEED_EXTERNALS` in `tsdown.config.ts` with `getStaticModules()` in your host's `packages/client/web/src/seed.ts` | Keep the two lists identical, rebuild |
 | Dialog shows `runtime-capability-missing: ...` | The host does not expose the required services | Read the message: it names the service and method | Expected on stock hosts. Implement `integration/README.md`, or accept that deletion stays disabled |
+| Dialog shows `unexpected-error: operation failed; inspect host logs for details.` at HTTP 500 | A plain (non-`SessionPurgeError`) exception reached the sanitizer; the real cause is one line above in the host log, tagged `session-purge: unexpected failure at <stage>` | The host log for the `session-purge: unexpected failure` line | The label is honest only with the log line: the route logs the raw error before answering. On a correctly wired host this string must not appear for the plain "host has no delete primitive" case — that answers `runtime-capability-missing` instead |
 | Response `409` with `session-live` / `session-still-live` | A live agent exists but the host exposes no safe stop capability, or the registry still lists it after `stop()` | Message text from `src/runtime-adapter.ts` | Stop the session first, or add the host-owned disposal bridge |
 | `npm warn allow-scripts` about `esbuild` | npm's script allow-list gate skipped esbuild's postinstall | Warning printed by `npm install` | Informational in this checkout (tests still ran); use `npm approve-scripts` if your setup needs esbuild's own install step |
 
