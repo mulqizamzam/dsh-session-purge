@@ -1,0 +1,6 @@
+# One insert row mounts the plugin module (resolved by package name from the
+# profile's node_modules). `config` is passed to the plugin's apply(ctx, config).
+- insert:
+    - id: session-purge
+      name: dsh-session-purge
+      config: {}
