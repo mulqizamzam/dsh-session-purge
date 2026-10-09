@@ -172,15 +172,21 @@ content-type: application/json
 
 | Condition | HTTP | Body |
 |---|---|---|
-| foreign `origin` header | 403 | `{"ok":false,"error":"cross-origin-request-rejected"}` |
+| `origin` whose host differs from the request's `host` authority | 403 | `{"ok":false,"error":"cross-origin-request-rejected"}` |
+| `origin` that is not a parsable URL | 403 | `{"ok":false,"error":"invalid-origin"}` |
+| `host` header absent or unparsable (nothing to bind against) | 403 | `{"ok":false,"error":"cross-origin-request-rejected"}` |
 | content-type not JSON | 415 | `{"ok":false,"error":"application-json-required"}` |
 | `confirm` missing or not `true` | 400 | `{"ok":false,"error":"sessionId-and-confirm-true-required"}` |
 | malformed id | 400 | `... "error":"invalid-session-id: sessionId must be a UUID, optionally prefixed with \"session-\"."` |
 | valid id, host lacks capabilities | 501 | `... "stage":"stop-agent"` with a `runtime-capability-missing` message |
 
-Through the running host, the connection transport applies its own trust and
-authentication policy before this handler runs, so an unauthenticated client sees
-the host's rejection first: Perlu dikonfirmasi against your own host's auth.
+A browser always attaches `Origin` to a POST, and a same-origin one compares equal
+on host, so the GUI's own delete request is admitted. Through the running host,
+the connection transport applies its own trust and authentication policy before
+this handler runs, so an unauthenticated client sees the host's rejection first.
+Measured against the live host with curl: no `Origin` → 401, `Origin:
+http://127.0.0.1:13080` → 401 (fence passed, auth failed), foreign `Origin` →
+403 "forbidden" from the host fence.
 
 **Model path.** Calling the `session_purge` tool never deletes anything:
 
@@ -337,11 +343,25 @@ Notes:
 - **The model cannot authorize deletion.** The `session_purge` tool returns
   `human-confirmation-required` unconditionally; only the UI route wired to the
   checkbox plus the confirm button may call the cleanup core (`src/index.ts`).
-- **Endpoint guards:** foreign `origin` rejected with 403, non-JSON body rejected
-  with 415, `confirm` must be the literal `true`, ids must be canonical UUIDs.
-  Authentication and transport trust are applied by the host's connection boundary
-  before this handler runs; verify both in your own host composition before exposing
-  it to an untrusted network.
+- **Endpoint guards:** an `origin` whose host differs from the request's `host`
+  authority is rejected with 403, non-JSON body rejected with 415, `confirm` must
+  be the literal `true`, ids must be canonical UUIDs. Authentication and transport
+  trust are applied by the host's connection boundary before this handler runs;
+  verify both in your own host composition before exposing it to an untrusted
+  network.
+- **The `origin` guard compares the Host authority, never `request.url`.** The host
+  bridges `/api` requests through `packages/client/connection/src/http-bridge.ts`,
+  which rebuilds every URL against the synthetic base `http://dsh.internal`, so a
+  browser's `Origin` can never equal `request.url`'s origin. Comparing the two is
+  what rejected every real browser delete with `cross-origin-request-rejected`,
+  while leaving a non-browser client without an `Origin` header as the only caller
+  that could pass. The guard now compares `new URL(origin).host` against the
+  normalized `Host` authority, the same pair the host's own `/api` trust fence
+  binds (`packages/client/connection/src/api-request-trust.ts`), and deliberately
+  does not compare the scheme, so a TLS-terminating proxy still works.
+  `test/api-route.test.ts` locks this: same-origin admitted end to end, and
+  foreign-origin, wrong-port, unparsable-origin, and missing-Host all rejected
+  with nothing deleted.
 - **Never replace the capability checks with direct file deletion.** Persistence can
   hold in-memory indexes and recreate a removed artifact; see `integration/README.md`.
 - **`.gitignore` keeps the dangerous and the generated out of the repository**:

@@ -26,6 +26,22 @@ function connectionOf(ctx: Context): ConnectionService {
   return connection
 }
 
+/**
+ * Authority of a Host header, normalized the way the host's own /api trust fence
+ * normalizes it: parse the bare authority under `http:` (a WHATWG special scheme,
+ * so the hostname survives and the parse throws on junk), which drops default
+ * ports and keeps IPv6 literals bracketed. `undefined` means absent or
+ * unparsable, and must fail closed.
+ */
+function hostAuthority(value: string | null): string | undefined {
+  if (value === null) return undefined
+  try {
+    return new URL(`http://${value.trim()}`).host
+  } catch {
+    return undefined
+  }
+}
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -93,12 +109,24 @@ export function apply(ctx: Context): void {
       if (request.method !== 'POST') return json({ ok: false, error: 'method-not-allowed' }, 405)
       const origin = request.headers.get('origin')
       if (origin) {
+        // `request.url` cannot name this deployment's authority: the host bridges
+        // /api requests through packages/client/connection/src/http-bridge.ts,
+        // which rebuilds each URL against the synthetic base `http://dsh.internal`,
+        // so its origin is never the browser's. The Host header is the authority
+        // the browser actually dialed and the one the host's own /api trust fence
+        // binds, so compare the two hosts. Scheme is deliberately not compared:
+        // behind a TLS-terminating proxy the page origin is `https:` while the
+        // Host header it forwards carries no scheme, and the host fence accepts
+        // that same pair.
+        const authority = hostAuthority(request.headers.get('host'))
+        let originHost: string
         try {
-          if (new URL(origin).origin !== new URL(request.url).origin) {
-            return json({ ok: false, error: 'cross-origin-request-rejected' }, 403)
-          }
+          originHost = new URL(origin).host
         } catch {
           return json({ ok: false, error: 'invalid-origin' }, 403)
+        }
+        if (authority === undefined || originHost !== authority) {
+          return json({ ok: false, error: 'cross-origin-request-rejected' }, 403)
         }
       }
       if (!request.headers.get('content-type')?.toLowerCase().includes('application/json')) {
