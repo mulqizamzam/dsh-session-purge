@@ -86,6 +86,62 @@ function resultStatus(result: PurgeResult): number {
   return 500
 }
 
+/**
+ * Tell the host's Session list that this id is gone.
+ *
+ * The session-controller converts `session/disposed` into the
+ * `api-session/removed` wire event, which is what makes a Client drop a row
+ * (`packages/api/session-controller/src/index.ts` emits it from that listener;
+ * `packages/api/session-controller/src/client/index.ts` subscribes to it and the
+ * manager records a `remove` mutation for the row). A session deleted straight
+ * from the sidebar is cold: the store never entered it, so no `session/disposed`
+ * edge exists and that chain never runs. The Client therefore kept the row, and
+ * with the workspace membership this purge releases the row moved to the
+ * "Ungrouped" group instead of disappearing.
+ *
+ * The event name is a string contract rather than a typed one: its Context event
+ * map entry is declared by the session-controller package, which this plugin
+ * does not depend on. The controller still owns the policy — a subagent row is
+ * flagged rather than removed — so this reports only the fact of the deletion.
+ * @param ctx - plugin context, whose scope dispatches to the host's listeners.
+ * @param id - the canonical session id whose log was deleted.
+ */
+function announceRemoval(ctx: Context, id: string): void {
+  const emitter = ctx as Context & { readonly emit: (event: string, ...args: unknown[]) => void }
+  emitter.emit('api-session/removed', id)
+}
+
+/**
+ * Drop the `sessionPersistence.list` read cache so the next list rescan sees the
+ * deletion. `dsh-session-readcache` memoizes that directory scan — the very call
+ * behind `session.list` — and invalidates the memo only on `session/disposed`,
+ * which the store emits for sessions it had entered. A session deleted straight
+ * from the sidebar is cold (never entered), so no event fires, the memo keeps
+ * serving the pre-delete scan, and the deleted session keeps appearing — with
+ * its workspace membership released, the client renders that leftover under
+ * "Ungrouped". The plugin exposes a POST-only purge route for exactly this;
+ * a host without it answers 404 and the purge stays complete.
+ *
+ * Best-effort by contract: the log is already gone, so a cache call that fails
+ * for any reason must not turn a completed deletion into a reported failure.
+ * @param ctx - the plugin context, used only to read the web server's port.
+ */
+async function purgeSessionListCache(ctx: Context): Promise<void> {
+  try {
+    const webServer = typeof ctx.get === 'function'
+      ? ctx.get('webServer') as { readonly port?: number } | undefined
+      : undefined
+    const port = webServer?.port
+    if (typeof port !== 'number' || !Number.isInteger(port) || port <= 0) return
+    await fetch(`http://127.0.0.1:${String(port)}/plugin/session-readcache/purge`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(2000),
+    })
+  } catch {
+    /* an unreachable or absent read cache cannot undo the deletion */
+  }
+}
+
 export function apply(ctx: Context): void {
   const resolved = new Map<string, object>()
   for (const name of OPTIONAL_SERVICES) {
@@ -184,6 +240,18 @@ export function apply(ctx: Context): void {
         const result = await purgeSession(runtime, input.sessionId, request.signal, (error, stage) => {
           logUnexpected(ctx, error, stage)
         })
+        // Only once the artifact is really gone: the read cache must not be
+        // dropped for a deletion that did not happen, or the next list would
+        // rescan a session that still exists. Failure here is contained — the
+        // deleted log is the fact the response reports.
+        if (result.log) {
+          // Both are downstream of a deletion that actually happened, so neither
+          // can turn a completed deletion into a reported failure: the Client's
+          // row is dropped through the wire event, and the memoized list scan is
+          // dropped so the next full refresh cannot resurrect it.
+          announceRemoval(ctx, result.id)
+          await purgeSessionListCache(ctx)
+        }
         return json(result, resultStatus(result))
       } catch (error) {
         logUnexpected(ctx, error, 'route')

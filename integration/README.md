@@ -24,6 +24,18 @@ Measured host APIs the adapter actually calls (DSH `0.2.0-rc.2` source, 2026-10-
 
 A stock DSH version without `sessionPersistence.delete()` will return an explicit unsupported-capability response (HTTP 501) and will not delete anything. If stopping a live agent, flushing, detaching, or cache/ledger cleanup is unsupported, deletion aborts before the log is touched or reports partial cleanup after the log is deleted. Do not replace these checks with direct deletion of `~/.dsh/sessions` files: persistence can retain in-memory indexes and later recreate removed artifacts.
 
+## Post-delete notifications (measured 2026-10-10)
+
+A deletion that leaves the artifact gone still has to make the row disappear. Three mechanisms are involved, and each is downstream of `result.log === true`, so none can turn a completed deletion into a reported failure.
+
+| Step | Mechanism | Why it is needed |
+|---|---|---|
+| Session-list notification | This plugin emits `api-session/removed`; `packages/api/session-controller/src/client/index.ts` subscribes to it and the manager records a `remove` mutation | The session-controller emits that wire event only from its `session/disposed` listener. A session deleted from the sidebar is cold — the store never entered it — so the chain never ran and the Client kept the row. With the workspace membership the purge releases, that leftover row moved to the "Ungrouped" group instead of disappearing. |
+| Read-cache invalidation | `POST :<port>/plugin/session-readcache/purge` | `dsh-session-readcache` memoizes the `sessionPersistence.list` directory scan behind `session.list` and invalidates on `session/disposed` only; a cold session produces none. The route is POST-only and answers 404 on a host without the plugin. |
+| Client refresh | `ctx.sessions.refresh()` (`ISessions.refresh` -> `SessionManager.refreshList`, single-flight per Host generation) | The `sessions.list.refreshInPlace` call this replaced does not exist anywhere in the host, so the refresh was a silent no-op. |
+
+Live evidence for the symptom these close: a host answering `{"ok":true,...,"stage":"complete"}` with the artifact removed while the row stayed visible and its workspace membership was released.
+
 ## Recommended upstream implementation path
 
 1. Add a serialized `delete(SessionId)` primitive to the `SessionPersistence` contract and implement it for every configured backend.

@@ -123,11 +123,23 @@ export const name = 'session-purge-client'
 export const inject = ['slots', 'locale']
 
 export function apply(ctx: ClientContext): void {
+  // `ctx.sessions.refresh()` re-pulls the real baseline through session/list
+  // (ISessions.refresh -> ClientSessions.refresh -> SessionManager.refreshList,
+  // single-flight per Host generation). The previous `sessions.list.refreshInPlace`
+  // does not exist anywhere in this host, so the optional-chained call was a
+  // silent no-op: after a successful delete the row stayed put until the user
+  // happened to trigger a refresh. A host that still lacks the method now says so
+  // instead of failing quietly.
   const loose = ctx as ClientContext & {
-    sessions?: { list?: { refreshInPlace?: () => void | Promise<void> } }
+    sessions?: { refresh?: () => void | Promise<void> }
   }
   const controller = new SessionPurgeController(async () => {
-    await loose.sessions?.list?.refreshInPlace?.()
+    const refresh = loose.sessions?.refresh
+    if (typeof refresh !== 'function') {
+      console.warn('[session-purge] host exposes no sessions.refresh(); the sidebar keeps cached rows until its next refresh')
+      return
+    }
+    await refresh()
   })
 
   ctx.effect(() => ctx.locale.register(NS, { en, zh }), 'session-purge: dictionaries')

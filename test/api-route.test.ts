@@ -77,7 +77,7 @@ interface Harness {
  * `apply` when the service already exists (measured), so requests issued after
  * this helper resolves see a fully captured resolver.
  */
-async function install(services?: Record<string, object>): Promise<Harness> {
+async function install(services?: Record<string, object>, webServerPort?: number): Promise<Harness> {
   const routes: RegisteredRoute[] = []
   const deleted: string[] = []
   const logs: string[] = []
@@ -101,6 +101,13 @@ async function install(services?: Record<string, object>): Promise<Harness> {
       })
       for (const [name, value] of Object.entries(services ?? {})) {
         c.reflect.provide(name, value)
+      }
+      // Read through ctx.get, never ctx.<name>: the plugin did not inject
+      // `webServer`, and a property read of a service it did not inject throws on
+      // a real cordis context. Omitted entirely when the test provides no port,
+      // which is how this plugin behaves on a host with no web surface.
+      if (webServerPort !== undefined) {
+        c.reflect.provide('webServer', { port: webServerPort, host: '127.0.0.1' })
       }
     },
   })
@@ -145,7 +152,7 @@ function deleteCapablePersistence(deleted: string[], deleteCalls?: { id: string;
 
 async function post(route: RegisteredRoute, body: unknown, headers: Record<string, string>) {
   const response = await route.fetch(browserRequest(body, headers))
-  return { status: response.status, payload: await response.json() as { ok?: boolean; error?: string; stage?: string } }
+  return { status: response.status, payload: await response.json() as { ok?: boolean; log?: boolean; error?: string; stage?: string } }
 }
 
 let active: Harness[] = []
@@ -393,8 +400,7 @@ describe('host API shapes the adapter must call correctly', () => {
   })
 })
 
-describe('the stored id form reaches persistence unchanged', () => {
-  /**
+describe('the stored id form reaches persistence unchanged', () => {  /**
    * Persistence that keys one artifact by the EXACT id, like the JSONL
    * backend's `sessionDir(root, cwd, id)`: `stat` resolves only the stored
    * form, so an id rewritten on the way in looks like an absent session.
@@ -442,5 +448,194 @@ describe('the stored id form reaches persistence unchanged', () => {
     expect(status).toBe(200)
     expect(deleted).toEqual([ID])
     expect([...artifacts]).toEqual([])
+  })
+})
+
+describe('the session-list read cache is purged with the log', () => {
+  /** Persistence whose artifact survives, so `result.log` is false. */
+  function survivingLogPersistence(): Record<string, object> {
+    return {
+      agents: { get: () => undefined, list: () => [] },
+      sessions: { get: () => undefined, list: () => [], flush: async () => true },
+      sessionPersistence: {
+        delete: async () => {},
+        stat: async () => ({ header: { id: ID } }),
+        listSync: () => [] as readonly { id?: string }[],
+      },
+      sessionProjectionCache: { purge: async () => true },
+      workspaceRegistry: { releaseSession: async () => {} },
+    }
+  }
+
+  /** Persistence whose artifact is gone, so `result.log` is true. */
+  function deletedLogPersistence(): Record<string, object> {
+    return {
+      agents: { get: () => undefined, list: () => [] },
+      sessions: { get: () => undefined, list: () => [], flush: async () => true },
+      sessionPersistence: {
+        delete: async () => {},
+        stat: async () => undefined,
+        listSync: () => [] as readonly { id?: string }[],
+      },
+      sessionProjectionCache: { purge: async () => true },
+      workspaceRegistry: { releaseSession: async () => {} },
+    }
+  }
+
+  async function openedWithWebServer(services: Record<string, object>, port: number): Promise<Harness> {
+    const harness = await install(services, port)
+    active.push(harness)
+    return harness
+  }
+
+  // Regression: a session deleted from the sidebar is cold (never entered), so
+  // the store emits no `session/disposed` and dsh-session-readcache keeps
+  // serving its memoized directory scan — the deleted session kept appearing,
+  // and with its workspace membership already released the client rendered it
+  // under "Ungrouped". The purge must therefore drop that read cache.
+  it('posts to the readcache purge route once the log is gone', async () => {
+    const calls: { url: string, init?: RequestInit }[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init })
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as typeof globalThis.fetch
+    try {
+      const { routes } = await openedWithWebServer(deletedLogPersistence(), 13080)
+      const { status } = await post(routes[0], { sessionId: ID, confirm: true }, {
+        host: '127.0.0.1:13080',
+        origin: 'http://127.0.0.1:13080',
+      })
+      expect(status).toBe(200)
+      expect(calls).toHaveLength(1)
+      expect(calls[0].url).toBe('http://127.0.0.1:13080/plugin/session-readcache/purge')
+      expect(calls[0].init?.method).toBe('POST')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('does not purge the read cache when the log survived', async () => {
+    const calls: unknown[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = ((input: unknown) => {
+      calls.push(input)
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as typeof globalThis.fetch
+    try {
+      const { routes } = await openedWithWebServer(survivingLogPersistence(), 13080)
+      await post(routes[0], { sessionId: ID, confirm: true }, {
+        host: '127.0.0.1:13080',
+        origin: 'http://127.0.0.1:13080',
+      })
+      expect(calls).toEqual([])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  // The read cache is an optimization on a host that has it; the deletion it
+  // mirrors is the fact. A purge that cannot reach the route (no web server, no
+  // plugin, connection refused) must leave the reported outcome untouched.
+  it('reports the completed deletion unchanged when the purge route is unreachable', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (() => Promise.reject(new Error('ECONNREFUSED'))) as typeof globalThis.fetch
+    try {
+      const { routes } = await openedWithWebServer(deletedLogPersistence(), 13080)
+      const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+        host: '127.0.0.1:13080',
+        origin: 'http://127.0.0.1:13080',
+      })
+      expect(status).toBe(200)
+      expect(payload.ok).toBe(true)
+      expect(payload.log).toBe(true)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
+describe('the host session list is told the id is gone', () => {
+  /** Listener on another plugin's context, which is how api-remotes subscribes. */
+  async function installWithListener(services: Record<string, object>): Promise<{
+    routes: RegisteredRoute[]
+    removed: string[]
+    dispose(): Promise<void>
+  }> {
+    const routes: RegisteredRoute[] = []
+    const removed: string[] = []
+    const root = new Context()
+    const host = root.plugin({
+      name: 'forwarder',
+      apply(c) {
+        const reflect = c.reflect as unknown as { provide: (name: string, value: object) => void }
+        reflect.provide('tools', { register: () => {} })
+        reflect.provide('connection', {
+          fetch: { register: (route: RegisteredRoute) => { routes.push(route); return () => {} } },
+        })
+        for (const [name, value] of Object.entries(services)) reflect.provide(name, value)
+        // `as never` on both sides mirrors how the host's own forwarder
+        // subscribes to this package-foreign event map (packages/api/remotes).
+        c.on('api-session/removed' as never, ((sessionId: unknown) => { removed.push(String(sessionId)) }) as never)
+      },
+    })
+    await host
+    const plugin = root.plugin({ name: 'session-purge', inject: ['tools', 'connection'], apply })
+    await plugin
+    return {
+      routes,
+      removed,
+      dispose: async () => {
+        await plugin.dispose()
+        await host.dispose()
+      },
+    }
+  }
+
+  function purgeablePersistence(status: 'gone' | 'present'): Record<string, object> {
+    return {
+      agents: { get: () => undefined, list: () => [] },
+      sessions: { get: () => undefined, list: () => [], flush: async () => true },
+      sessionPersistence: {
+        delete: async () => {},
+        stat: async () => (status === 'gone' ? undefined : { header: { id: ID } }),
+        listSync: () => [] as readonly { id?: string }[],
+      },
+      sessionProjectionCache: { purge: async () => true },
+      workspaceRegistry: { releaseSession: async () => {} },
+    }
+  }
+
+  // Regression: the store emits `session/disposed` only for sessions it entered,
+  // and the session-controller turns that edge into the `api-session/removed`
+  // wire event the Client drops a row on. A sidebar-deleted session is cold, so
+  // that chain never ran and the Client kept the row — which, with the purge's
+  // own workspace release applied, moved to the "Ungrouped" group instead of
+  // disappearing. The purge must report the removal itself.
+  it('emits api-session/removed with the canonical id once the log is gone', async () => {
+    const harness = await installWithListener(purgeablePersistence('gone'))
+    try {
+      const { status } = await post(harness.routes[0], { sessionId: `session-${ID}`, confirm: true }, {
+        host: '127.0.0.1:13080',
+        origin: 'http://127.0.0.1:13080',
+      })
+      expect(status).toBe(200)
+      expect(harness.removed).toEqual([`session-${ID}`])
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('does not announce a removal while the log survived', async () => {
+    const harness = await installWithListener(purgeablePersistence('present'))
+    try {
+      await post(harness.routes[0], { sessionId: `session-${ID}`, confirm: true }, {
+        host: '127.0.0.1:13080',
+        origin: 'http://127.0.0.1:13080',
+      })
+      expect(harness.removed).toEqual([])
+    } finally {
+      await harness.dispose()
+    }
   })
 })
