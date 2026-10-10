@@ -8,10 +8,11 @@ import {
  */
 interface LooseService {
   get?: (id: string) => unknown
-  flush?: (id: string, signal?: AbortSignal) => Promise<unknown>
+  flush?: (session: unknown) => Promise<unknown>
   detach?: (id: string) => Promise<unknown> | unknown
   stop?: () => Promise<unknown> | unknown
-  delete?: (id: string, signal?: AbortSignal) => Promise<unknown>
+  delete?: (id: string, options?: { signal?: AbortSignal }) => Promise<unknown>
+  stat?: (id: string) => Promise<unknown>
   listSync?: () => readonly { id?: string }[]
   purge?: (id: string) => Promise<boolean>
   releaseSession?: (id: string) => Promise<unknown> | unknown
@@ -95,15 +96,27 @@ export function createRuntimeAdapter(resolve: ServiceResolver): SessionPurgeRunt
       }
       const liveSession = sessions.get(id)
       if (!liveSession) return
-      const flush = sessions.flush ?? persistence?.flush
-      if (typeof flush !== 'function') {
-        throw new SessionPurgeError(
-          'flush-unavailable',
-          'flush-session',
-          'A live session exists but the runtime exposes no flush method; refusing to delete its log.',
-        )
+      // The real host API is `flush(session)` — the Session object, not the id
+      // (packages/core/session SessionStore). Passing the id string made the
+      // host dereference a string and throw a TypeError, which surfaced as
+      // `unexpected-error`. `persistence.flush()` is the service-wide
+      // equivalent and takes no arguments.
+      if (typeof sessions.flush === 'function') {
+        await (sessions.flush as (session: unknown) => Promise<unknown>).call(sessions, liveSession)
+        return
       }
-      await flush.call(sessions.flush ? sessions : persistence, id, signal)
+      // SessionPersistence.flush() is the service-wide barrier and takes no
+      // arguments; it is a different shape from SessionStore.flush(session).
+      const serviceWideFlush = (persistence as { flush?: () => Promise<unknown> } | undefined)?.flush
+      if (typeof serviceWideFlush === 'function') {
+        await serviceWideFlush.call(persistence)
+        return
+      }
+      throw new SessionPurgeError(
+        'flush-unavailable',
+        'flush-session',
+        'A live session exists but the runtime exposes no flush method; refusing to delete its log.',
+      )
     },
 
     async detachSession(id) {
@@ -133,12 +146,12 @@ export function createRuntimeAdapter(resolve: ServiceResolver): SessionPurgeRunt
 
     async deleteLog(id, signal) {
       const persistence = resolve('sessionPersistence')
-      const remove = needMethod<(id: string, signal?: AbortSignal) => Promise<unknown>>(
+      const remove = needMethod<(id: string, options?: { signal?: AbortSignal }) => Promise<unknown>>(
         persistence,
         'delete',
         'sessionPersistence',
       )
-      await remove(id, signal)
+      await remove(id, { signal })
     },
 
     async logIsAbsent(id) {
@@ -150,8 +163,14 @@ export function createRuntimeAdapter(resolve: ServiceResolver): SessionPurgeRunt
           'The persistence service is unavailable; log absence cannot be verified.',
         )
       }
-      // A successful delete() is itself a postcondition in compatible persistence
-      // providers. If listSync is also exposed, use it as an independent check.
+      // Mechanical absence check on the real host API: stat() resolves the
+      // snapshot or `undefined` once the artifact is gone. Trusting the
+      // delete() postcondition alone reported "verified" without observing
+      // anything, so stat is preferred whenever the host exposes it.
+      if (typeof persistence.stat === 'function') {
+        return await (persistence.stat as (id: string) => Promise<unknown>).call(persistence, id) === undefined
+      }
+      // Older-shaped providers: a successful delete() is itself a postcondition.
       if (typeof persistence.listSync !== 'function') return true
       return !persistence.listSync().some(row => {
         if (typeof row.id !== 'string') return false

@@ -154,18 +154,20 @@ One worked example, from install to the expected outcome.
 3. The dialog reads `Delete this session permanently?` and requires the checkbox
    `I understand this is permanent and cannot be undone.` before the
    `Delete permanently` button becomes active (`src/client/index.tsx`).
-4. On a stock host the dialog then shows
-   `Deletion failed: runtime-capability-missing: ...` and **no file is deleted**.
-   That is the expected, fail-closed outcome until the host ships the integration
-   in `integration/README.md`. Measured against DSH `0.2.0-rc.2` (the host this
-   checkout was verified on): `SessionPersistence` exposes `create`/`open`/
-   `flush`/`stat`/`list` and **no `delete`**, `SessionStore` has no `detach`,
-   `SessionProjectionCache` has no `purge`, and the workspace registry exposes
-   neither `releaseSession` nor `detachSession` — so rc.2 *is* a stock host for
-   this contract, and HTTP 501 at stage `delete-log` is the live outcome there.
-   The dialog must not show `unexpected-error: operation failed; ...` for that
-   case; if it does, the host log line tagged
-   `session-purge: unexpected failure at <stage>` names the real cause.
+4. What happens next depends on the host's capabilities, and the dialog names
+   the missing one. The three host primitives this plugin consumes
+   (`sessionPersistence.delete`, `sessionProjectionCache.purge`,
+   `workspaceRegistry.releaseSession`) were added to the harness checkout this
+   plugin was verified against (2026-10-10; see `integration/README.md`), so a
+   **detached** session deletes end to end once the profile restarts on that
+   build. Two fail-closed cases remain by design: a session with a live agent
+   answers `session-live` (stop it first), and a session still attached to the
+   store answers `runtime-capability-missing` at stage `detach-session` (the
+   host's `SessionStore` still exposes no `detach`). On a host without the
+   three primitives the answer is `runtime-capability-missing` naming the
+   first missing service, and **no file is deleted**. The dialog must never
+   show `unexpected-error: operation failed: ...`; if it does, the host log
+   line tagged `session-purge: unexpected failure at <stage>` names the cause.
 5. On an integrated host the list refreshes in place, the dialog closes, and the
    session is gone after the seven steps of the cleanup contract.
 

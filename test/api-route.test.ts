@@ -125,12 +125,17 @@ async function install(services?: Record<string, object>): Promise<Harness> {
 }
 
 /** Success-capable persistence: the host primitive this scaffold documents. */
-function deleteCapablePersistence(deleted: string[]): Record<string, object> {
+function deleteCapablePersistence(deleted: string[], deleteCalls?: { id: string; options?: { signal?: AbortSignal } }[]): Record<string, object> {
   return {
     agents: { get: () => undefined, list: () => [] },
     sessions: { get: () => undefined, list: () => [], flush: async () => true },
     sessionPersistence: {
-      delete: async (id: string) => { deleted.push(id) },
+      delete: async (id: string, options?: { signal?: AbortSignal }) => {
+        deleted.push(id)
+        deleteCalls?.push({ id, options })
+      },
+      // The real host's mechanical absence check (SessionPersistence.stat).
+      stat: async () => undefined,
       listSync: () => [] as readonly { id?: string }[],
     },
     sessionProjectionCache: { purge: async () => true },
@@ -168,7 +173,8 @@ describe('POST /api/session-purge/delete origin gate', () => {
   // from the browser while the identical request without Origin succeeded.
   it('admits a same-origin browser POST and completes the purge', async () => {
     const deleted: string[] = []
-    const { routes } = await opened(deleteCapablePersistence(deleted))
+    const deleteCalls: { id: string; options?: { signal?: AbortSignal } }[] = []
+    const { routes } = await opened(deleteCapablePersistence(deleted, deleteCalls))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
       host: '127.0.0.1:13080',
       origin: 'http://127.0.0.1:13080',
@@ -176,6 +182,10 @@ describe('POST /api/session-purge/delete origin gate', () => {
     expect(status).toBe(200)
     expect(payload.ok).toBe(true)
     expect(deleted).toEqual([ID])
+    // The host delete() takes an options object carrying the request signal,
+    // matching the SessionPersistence method style; a positional signal threw
+    // the argument away.
+    expect(deleteCalls).toEqual([{ id: ID, options: expect.any(Object) }])
   })
 
   it('admits a request with no Origin header (non-browser clients reach the host fence instead)', async () => {
@@ -327,5 +337,58 @@ describe('host capability detection on a real cordis context', () => {
     expect(logs.some(line => line.includes('session-purge: unexpected failure at delete-log'))).toBe(true)
     expect(logs.some(line => line.includes('jsonl artifact locked by another process'))).toBe(true)
     expect(deleted).toEqual([])
+  })
+})
+
+describe('host API shapes the adapter must call correctly', () => {
+  // The host's SessionStore.flush takes the Session object, not the id. Passing
+  // the id string made the host dereference a string and throw a TypeError,
+  // which the sanitizer flattened into `unexpected-error` for every live session.
+  it('passes the live Session object to sessions.flush, not the id string', async () => {
+    const deleted: string[] = []
+    const liveSession = { header: { id: ID }, append: async () => ({}) }
+    const flushCalls: unknown[] = []
+    const services = deleteCapablePersistence(deleted)
+    services.sessions = {
+      get: (id: string) => (id === ID ? liveSession : undefined),
+      list: () => [],
+      flush: async (session: unknown) => { flushCalls.push(session); return true },
+    }
+    const { routes } = await opened(services)
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    // Flush runs before detach; the request then fails closed at detach because
+    // this host exposes no sessions.detach for attached sessions.
+    expect(flushCalls).toEqual([liveSession])
+    expect(status).toBe(501)
+    expect(payload.stage).toBe('detach-session')
+    expect(payload.error).toContain('sessions.detach')
+    expect(deleted).toEqual([])
+  })
+
+  // Absence must be observed through stat(), not inferred from delete()
+  // resolving: a provider that answers delete() while the artifact survives
+  // must stop the purge before cache and ledger cleanup.
+  it('refuses to report success when stat still observes the log after delete', async () => {
+    const deleted: string[] = []
+    const cachePurged: string[] = []
+    const ledgerReleased: string[] = []
+    const services = deleteCapablePersistence(deleted)
+    ;(services.sessionPersistence as { stat: (id: string) => Promise<unknown> }).stat = async () => ({ header: { id: ID } })
+    ;(services.sessionProjectionCache as { purge: (id: string) => Promise<boolean> }).purge = async (id: string) => { cachePurged.push(id); return true }
+    ;(services.workspaceRegistry as { releaseSession: (id: string) => Promise<void> }).releaseSession = async (id: string) => { ledgerReleased.push(id) }
+    const { routes } = await opened(services)
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(500)
+    expect(payload.stage).toBe('verify-log')
+    expect(payload.error).toContain('log-not-absent')
+    expect(deleted).toEqual([ID])
+    expect(cachePurged).toEqual([])
+    expect(ledgerReleased).toEqual([])
   })
 })
