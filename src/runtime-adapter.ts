@@ -64,6 +64,25 @@ export function createRuntimeAdapter(resolve: ServiceResolver): SessionPurgeRunt
           'The agents registry is unavailable; cannot prove that the session is not being written.',
         )
       }
+      // Host-owned disposal bridge first. The Web profile's session controller
+      // retains the AgentHandle it minted (ctx.agents.get() only ever returns a
+      // bare Agent), and its closeSession() runs the real dispose: stop, drain,
+      // unregister, remove from the store. Without it a live Session could never
+      // be deleted — which is the reported "session baru tidak bisa dihapus".
+      const controller = resolve('sessionController') as {
+        closeSession?: (sessionId: string) => Promise<unknown>
+      } | undefined
+      if (controller && typeof controller.closeSession === 'function') {
+        await controller.closeSession(id)
+        if (agents.get(id)) {
+          throw new SessionPurgeError(
+            'session-still-live',
+            'stop-agent',
+            'The agent still appears in the registry after the host disposal bridge ran; refusing to delete a log that may still be written.',
+          )
+        }
+        return
+      }
       const agent = agents.get(id) as { stop?: () => Promise<unknown> | unknown } | undefined
       if (!agent) return
       if (typeof agent.stop !== 'function') {

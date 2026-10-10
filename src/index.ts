@@ -30,6 +30,9 @@ const OPTIONAL_SERVICES = [
   'sessionPersistence',
   'sessionProjectionCache',
   'workspaceRegistry',
+  // The Web profile's session controller, which owns the disposal bridge
+  // (`closeSession`) that lets a live Session be released before deletion.
+  'sessionController',
 ] as const
 
 function logUnexpected(ctx: Context, error: unknown, stage: string): void {

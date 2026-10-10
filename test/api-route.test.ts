@@ -639,3 +639,87 @@ describe('the host session list is told the id is gone', () => {
     }
   })
 })
+
+describe('the host disposal bridge releases a live agent before deletion', () => {
+  /** Live agent with no plugin-visible stop(), plus a host bridge that removes it. */
+  function bridgeHost(closed: string[]): Record<string, object> {
+    let live: unknown = { id: ID }
+    return {
+      agents: {
+        get: () => live,
+        list: () => (live === undefined ? [] : [live]),
+      },
+      sessions: { get: () => undefined, list: () => [], flush: async () => true },
+      sessionPersistence: {
+        delete: async () => {},
+        stat: async () => undefined,
+        listSync: () => [] as readonly { id?: string }[],
+      },
+      sessionProjectionCache: { purge: async () => true },
+      workspaceRegistry: { releaseSession: async () => {} },
+      sessionController: {
+        closeSession: async (sessionId: string) => { closed.push(sessionId); live = undefined },
+      },
+    }
+  }
+
+  /** Same live agent, but the host exposes no bridge at all. */
+  function noBridgeHost(): Record<string, object> {
+    return {
+      agents: { get: () => ({ id: ID }), list: () => [{ id: ID }] },
+      sessions: { get: () => undefined, list: () => [], flush: async () => true },
+      sessionPersistence: {
+        delete: async () => {},
+        stat: async () => undefined,
+        listSync: () => [] as readonly { id?: string }[],
+      },
+      sessionProjectionCache: { purge: async () => true },
+      workspaceRegistry: { releaseSession: async () => {} },
+    }
+  }
+
+  // Regression: a Session the current host process has opened keeps an attached
+  // agent, and no GUI affordance or plugin-visible `stop()` exists to release it.
+  // Deletion therefore failed closed with 409 session-live, and the log survived.
+  // The Web profile's session controller owns the real capability
+  // (ctx.agents.get() returns a bare Agent, the AgentHandle is retained by its
+  // creator), and closeSession() runs the actual dispose.
+  it('deletes a live-agent Session when the host exposes closeSession', async () => {
+    const closed: string[] = []
+    const { routes } = await opened(bridgeHost(closed))
+    const { status, payload } = await post(routes[0], { sessionId: `session-${ID}`, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(200)
+    expect(payload.ok).toBe(true)
+    expect(payload.stage).toBe('complete')
+    expect(closed).toEqual([`session-${ID}`])
+  })
+
+  it('verifies the agent is really gone after the bridge ran', async () => {
+    // A bridge that answers without unregistering must not let the purge through.
+    const { routes } = await opened({
+      ...bridgeHost([]),
+      sessionController: { closeSession: async () => {} },
+    })
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(409)
+    expect(payload.stage).toBe('stop-agent')
+    expect(payload.error).toContain('session-still-live')
+  })
+
+  it('still fails closed with session-live when the host has no bridge', async () => {
+    const { routes } = await opened(noBridgeHost())
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(409)
+    expect(payload.stage).toBe('stop-agent')
+    expect(payload.error).toContain('session-live')
+  })
+})
