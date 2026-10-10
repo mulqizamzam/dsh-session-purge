@@ -18,12 +18,23 @@ function runtime(overrides: Partial<SessionPurgeRuntime> = {}) {
 }
 
 describe('normalizeSessionId', () => {
-  it('accepts raw and prefixed UUIDs and returns one canonical id', () => {
+  it('preserves the stored id form, because persistence keys each artifact by it verbatim', () => {
     expect(normalizeSessionId(ID)).toBe(ID)
-    expect(normalizeSessionId(`session-${ID}`)).toBe(ID)
+    expect(normalizeSessionId(`session-${ID}`)).toBe(`session-${ID}`)
+    expect(normalizeSessionId(`  session-${ID.toUpperCase()}  `)).toBe(`session-${ID}`)
   })
   it('rejects path-like or malformed ids', () => {
     expect(() => normalizeSessionId('../../sessions')).toThrow(/UUID/)
+    expect(() => normalizeSessionId('session-../..')).toThrow(/UUID/)
+  })
+  it('hands the persistence layer the same id the host reported', async () => {
+    const seen: string[] = []
+    const { runtime: adapter } = runtime({
+      deleteLog: async id => { seen.push(id) },
+      logIsAbsent: async id => { seen.push(id); return true },
+    })
+    await purgeSession(adapter, `session-${ID}`)
+    expect(seen).toEqual([`session-${ID}`, `session-${ID}`])
   })
 })
 

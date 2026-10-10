@@ -53,7 +53,20 @@ export class SessionPurgeError extends Error {
   }
 }
 
-/** Accepts a bare UUID or the display/storage form `session-<uuid>`. */
+/**
+ * Validate a session id and return it in the form the host stores it.
+ *
+ * The persistence layer keys each artifact by the `SessionId` verbatim
+ * (`sessionDir(root, cwd, id)` = `projectDir/encodeSegment(id)`), and the host
+ * mints both forms in the wild: `<uuid>` and `session-<uuid>`. The session list
+ * therefore reports the stored form, and that is the id this plugin receives.
+ * Stripping the prefix rewrote `session-<uuid>` to `<uuid>`, so every lookup
+ * resolved to a non-existent artifact — which the backend reports as "already
+ * absent", turning the whole purge into a silent no-op answered with
+ * `ok: true`. The form is preserved; only the characters are normalized.
+ * @param raw - the id exactly as the host reported it.
+ * @returns the trimmed, lowercased id with its prefix intact.
+ */
 export function normalizeSessionId(raw: string): string {
   const trimmed = raw.trim()
   const bare = trimmed.startsWith('session-') ? trimmed.slice('session-'.length) : trimmed
@@ -65,7 +78,7 @@ export function normalizeSessionId(raw: string): string {
       'sessionId must be a UUID, optionally prefixed with "session-".',
     )
   }
-  return bare.toLowerCase()
+  return trimmed.toLowerCase()
 }
 
 function messageOf(error: unknown): string {

@@ -392,3 +392,55 @@ describe('host API shapes the adapter must call correctly', () => {
     expect(ledgerReleased).toEqual([])
   })
 })
+
+describe('the stored id form reaches persistence unchanged', () => {
+  /**
+   * Persistence that keys one artifact by the EXACT id, like the JSONL
+   * backend's `sessionDir(root, cwd, id)`: `stat` resolves only the stored
+   * form, so an id rewritten on the way in looks like an absent session.
+   */
+  function exactKeyPersistence(artifacts: Set<string>, deleted: string[]): Record<string, object> {
+    return {
+      agents: { get: () => undefined, list: () => [] },
+      sessions: { get: () => undefined, list: () => [], flush: async () => true },
+      sessionPersistence: {
+        delete: async (id: string) => { deleted.push(id); artifacts.delete(id) },
+        stat: async (id: string) => (artifacts.has(id) ? { header: { id } } : undefined),
+        listSync: () => [] as readonly { id?: string }[],
+      },
+      sessionProjectionCache: { purge: async () => true },
+      workspaceRegistry: { releaseSession: async () => {} },
+    }
+  }
+
+  // Regression: normalizeSessionId() stripped the `session-` prefix, so a
+  // host-minted `session-<uuid>` resolved to no artifact, the purge answered
+  // `ok: true` on the strength of that absence, and the GUI closed the dialog
+  // while the session stayed on disk — the reported "delete does nothing".
+  it('deletes a session-<uuid> artifact instead of answering a no-op success', async () => {
+    const artifacts = new Set([`session-${ID}`])
+    const deleted: string[] = []
+    const { routes } = await opened(exactKeyPersistence(artifacts, deleted))
+    const { status, payload } = await post(routes[0], { sessionId: `session-${ID}`, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(200)
+    expect(payload.ok).toBe(true)
+    expect(deleted).toEqual([`session-${ID}`])
+    expect([...artifacts]).toEqual([])
+  })
+
+  it('deletes a bare-uuid artifact too', async () => {
+    const artifacts = new Set([ID])
+    const deleted: string[] = []
+    const { routes } = await opened(exactKeyPersistence(artifacts, deleted))
+    const { status } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(200)
+    expect(deleted).toEqual([ID])
+    expect([...artifacts]).toEqual([])
+  })
+})
