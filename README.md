@@ -256,6 +256,7 @@ test/
   purge-core.test.ts    # ordering, failure-path and batch tests (16 tests)
   controller.test.ts    # client state machine tests (15 tests)
   api-route.test.ts     # route, origin gate, capability, model-tool refusal and batch tests (36 tests)
+  client-ui.test.ts     # jsdom mount of the real components, real events (14 tests)
 integration/
   README.md             # host capabilities required for real deletion
 cordis.patch.yml        # how the profile mounts this package (one insert row)
@@ -293,9 +294,9 @@ dsh plugin --profile <name> remove dsh-session-purge
 ## Testing
 
 Runner: vitest, invoked as `npm test`. There is no `vitest.config.*` file, so
-vitest's defaults pick up the three files under `test/`.
+vitest's defaults pick up the four files under `test/`.
 
-Three layers:
+Four layers:
 
 - `test/purge-core.test.ts` drives `purgeSession` and `purgeSessions` against a
   fake `SessionPurgeRuntime` and asserts ordering, failure paths, signal
@@ -312,6 +313,13 @@ Three layers:
   stubbed `fetch`: the dialog invariants (no open while busy, retry of only the
   failed remainder, current-session exclusion, selection-rows resolution, and
   that a truncated results array cannot drop an item from the retry set).
+- `test/client-ui.test.ts` runs the plugin's client `apply()` against a minimal
+  slots/locale surface and mounts the real components in jsdom (`react-dom/client`
+  with real events): slot registrations and dictionary coverage, the footer
+  button's snapshot of the live list (blank rows excluded), the manager's
+  checkbox rows with the current session disabled, select-all/clear/delete via
+  real clicks, the consent gate, the batch submit with its exact POST body,
+  per-item failure rendering, and the retry of only the failed remainder.
 
 What success looks like (observed):
 
@@ -328,8 +336,11 @@ Exit code 0 on pass (observed). A failing assertion is reported per test by vite
 and the process exits non-zero; that path was not reproduced in this checkout,
 because the suite passes.
 
-Only the browser slot, the client bundle loading inside the host's module table,
-and the live host transport remain untested here; they need a running profile.
+What remains untested here needs a running profile: the client bundle loading
+inside the host's browser module table, the real slot seats in the assembled
+shell, and the live host transport. Everything above those — route, batch
+orchestration, controller state machine, and component behavior — is covered
+headlessly.
 
 npm 11 may print `npm warn allow-scripts ... esbuild@0.28.2 (postinstall: node install.js)`
 during `npm install`. Observed in this checkout, and the test suite still passed.
