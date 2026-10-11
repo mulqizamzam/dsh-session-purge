@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { purgeSession, type PurgeResult } from './purge-core.ts'
+import { purgeSession, purgeSessions, type PurgeResult } from './purge-core.ts'
 import {
   createRuntimeAdapter,
   publicErrorMessage,
@@ -11,6 +11,13 @@ export const name = 'session-purge'
 export const inject = ['tools', 'connection']
 
 const DELETE_PATH = '/api/session-purge/delete'
+
+/**
+ * Upper bound on one batch request. The client only ever sends ids it listed
+ * from the live session snapshot, so this is a guard against an accidental
+ * unbounded loop on the host, not a product limit.
+ */
+const MAX_BATCH_IDS = 200
 
 /**
  * Host services the adapter capability-detects. They are captured through
@@ -85,8 +92,32 @@ function resultStatus(result: PurgeResult): number {
   if (result.ok) return 200
   if (result.stage === 'validate') return 400
   if (result.error.includes('runtime-capability-missing')) return 501
-  if (result.error.includes('session-live') || result.error.includes('session-still-live')) return 409
+  if (
+    result.error.includes('session-live')
+    || result.error.includes('session-still-live')
+    || result.error.includes('session-write-lease-held')
+  ) return 409
   return 500
+}
+
+/**
+ * HTTP status for a batch outcome, using the same severity order as the
+ * single-response mapping: a malformed request is the caller's bug (400), a
+ * host that cannot delete at all is a capability report (501), sessions that
+ * stay live or lease-held are retryable conflicts (409), and anything else is
+ * a genuine per-item failure (500). A mixed batch reports its most severe
+ * condition — the per-item `results` array carries the individual truth, and
+ * the dialog renders those, not this code.
+ */
+function batchStatus(results: readonly PurgeResult[]): number {
+  if (results.some(result => result.stage === 'validate')) return 400
+  if (results.some(result => result.error.includes('runtime-capability-missing'))) return 501
+  if (results.some(result => (
+    result.error.includes('session-live')
+    || result.error.includes('session-still-live')
+    || result.error.includes('session-write-lease-held')
+  ))) return 409
+  return results.every(result => result.ok) ? 200 : 500
 }
 
 /**
@@ -235,7 +266,48 @@ export function apply(ctx: Context): void {
         return json({ ok: false, error: 'invalid-json' }, 400)
       }
       if (!body || typeof body !== 'object') return json({ ok: false, error: 'invalid-request' }, 400)
-      const input = body as { sessionId?: unknown; confirm?: unknown }
+      const input = body as { sessionId?: unknown; sessionIds?: unknown; confirm?: unknown }
+      // Batch first: a body carrying `sessionIds` is always the multi-session
+      // form, even when it also carries `sessionId`. Both shapes share one path
+      // so the origin/auth fence, the buffering policy and the purge pipeline
+      // exist exactly once — a second route could drift from this one.
+      if (Array.isArray(input.sessionIds)) {
+        if (input.confirm !== true) {
+          return json({ ok: false, error: 'sessionIds-and-confirm-true-required' }, 400)
+        }
+        if (
+          input.sessionIds.length === 0
+          || input.sessionIds.length > MAX_BATCH_IDS
+          || !input.sessionIds.every(id => typeof id === 'string')
+        ) {
+          return json({ ok: false, error: `sessionIds-must-be-1..${String(MAX_BATCH_IDS)}-strings` }, 400)
+        }
+        try {
+          const batch = await purgeSessions(
+            runtime,
+            input.sessionIds as readonly string[],
+            request.signal,
+            (error, stage) => { logUnexpected(ctx, error, stage) },
+            async id => {
+              // Report each removal and drop the list read cache the moment the
+              // fact exists, so a failure or abort later in the batch cannot
+              // swallow the announcements of sessions that were really deleted.
+              // Both are reporting side-channels: a listener that throws must
+              // not rewrite a completed deletion into a reported failure.
+              try {
+                announceRemoval(ctx, id)
+              } catch (error) {
+                logUnexpected(ctx, error, 'announce')
+              }
+              await purgeSessionListCache(ctx)
+            },
+          )
+          return json(batch, batchStatus(batch.results))
+        } catch (error) {
+          logUnexpected(ctx, error, 'route')
+          return json({ ok: false, error: publicErrorMessage(error) }, 500)
+        }
+      }
       if (typeof input.sessionId !== 'string' || input.confirm !== true) {
         return json({ ok: false, error: 'sessionId-and-confirm-true-required' }, 400)
       }

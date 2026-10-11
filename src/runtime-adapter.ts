@@ -170,7 +170,27 @@ export function createRuntimeAdapter(resolve: ServiceResolver): SessionPurgeRunt
         'delete',
         'sessionPersistence',
       )
-      await remove(id, { signal })
+      try {
+        await remove(id, { signal })
+      } catch (error) {
+        // The host's own lease check: SessionPersistenceJsonl.delete throws
+        // SessionAlreadyOwnedError when any writer still holds the id (a live
+        // agent or an open handle). Before this mapping the sanitizer flattened
+        // it into `unexpected-error: operation failed; inspect host logs for
+        // details.` — factually correct and operationally useless, because the
+        // only actionable advice ("close the session, then retry") never reached
+        // the operator. The class name is a stable, evidence-backed contract
+        // (packages/session/session-persistence-jsonl); anything unrecognized
+        // still falls through sanitized.
+        if (typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'SessionAlreadyOwnedError') {
+          throw new SessionPurgeError(
+            'session-write-lease-held',
+            'delete-log',
+            'Another writer still holds this session (a live agent or an open handle); close it and retry — the log was not deleted.',
+          )
+        }
+        throw error
+      }
     },
 
     async logIsAbsent(id) {

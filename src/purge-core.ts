@@ -81,11 +81,78 @@ export function normalizeSessionId(raw: string): string {
   return trimmed.toLowerCase()
 }
 
+export interface BatchPurgeResult {
+  /** True only when every requested session reports a complete purge. */
+  ok: boolean
+  /** Number of ids this batch processed, duplicates included. */
+  total: number
+  succeeded: number
+  failed: number
+  /** Per-session outcomes in request order; the caller maps these back to its own rows. */
+  results: PurgeResult[]
+}
+
+/**
+ * Purge several sessions in one request, strictly one at a time and in the
+ * order given.
+ *
+ * Sequencing is deliberate: the per-session purge mutates shared host state
+ * (the session controller's live registry, the persistence writer, the
+ * workspace ledger), so parallel items would race on the very primitives each
+ * purge verifies. A failing item is isolated — its error is recorded and the
+ * loop continues, because a batch that stops at the first failure would leave
+ * the operator unable to tell which of N sessions were actually removed.
+ *
+ * The host persistence contract makes re-deleting an already-absent id a
+ * successful no-op (`SessionPersistenceJsonl.delete` treats absence as
+ * success and drops stale references), so processing duplicates as given is
+ * safe; the caller is still expected to send a deduplicated set.
+ *
+ * `onLogDeleted` fires once per id whose log is confirmed gone, before the
+ * next item starts, so the host layer can report each removal and drop the
+ * session-list read cache as soon as the fact exists instead of after the
+ * whole batch settles.
+ */
+export async function purgeSessions(
+  runtime: SessionPurgeRuntime,
+  rawIds: readonly string[],
+  signal?: AbortSignal,
+  onUnexpectedError?: (error: unknown, stage: PurgeStage) => void,
+  onLogDeleted?: (id: string) => void | Promise<void>,
+): Promise<BatchPurgeResult> {
+  const results: PurgeResult[] = []
+  let succeeded = 0
+  for (const rawId of rawIds) {
+    const result = await purgeSession(runtime, rawId, signal, onUnexpectedError)
+    results.push(result)
+    if (result.ok) succeeded += 1
+    if (result.log) await onLogDeleted?.(result.id)
+  }
+  return {
+    ok: results.length > 0 && succeeded === results.length,
+    total: results.length,
+    succeeded,
+    failed: results.length - succeeded,
+    results,
+  }
+}
+
 function messageOf(error: unknown): string {
   if (error instanceof SessionPurgeError) return `${error.code}: ${error.message}`
   // Avoid passing raw storage-provider errors (which may include host paths) to the client.
   if (error instanceof Error) return 'unexpected-error: operation failed; inspect host logs for details.'
   return 'unexpected-error: operation failed; inspect host logs for details.'
+}
+
+/**
+ * True when the failure is a cancellation, not a defect. The abort primitive
+ * throws a DOMException (which is NOT an `instanceof Error` in every runtime
+ * this plugin can run under), so the check is duck-typed on `name` and must
+ * stay runtime-agnostic. Classified separately because an aborted purge is
+ * neither a host defect worth a log line nor an opaque provider failure.
+ */
+function isAbort(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError'
 }
 
 /**
@@ -167,10 +234,17 @@ export async function purgeSession(
     }
     return result
   } catch (error) {
-    if (!(error instanceof SessionPurgeError)) onUnexpectedError?.(error, stage)
+    // A cancellation is an expected outcome (the browser navigated away, the
+    // request was aborted), not a host defect: it answers with its own code and
+    // writes no unexpected-error log line, which would otherwise fire for every
+    // remaining item of an aborted batch.
+    const aborted = isAbort(error)
+    if (!(error instanceof SessionPurgeError) && !aborted) onUnexpectedError?.(error, stage)
     result.id = id
     result.stage = stage
-    result.error = messageOf(error)
+    result.error = aborted
+      ? 'aborted: the deletion was cancelled before it completed; the session may still exist.'
+      : messageOf(error)
     return result
   }
 }

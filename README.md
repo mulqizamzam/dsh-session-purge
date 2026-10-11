@@ -172,6 +172,24 @@ One worked example, from install to the expected outcome.
 5. On an integrated host the list refreshes in place, the dialog closes, and the
    session is gone after the seven steps of the cleanup contract.
 
+**Multi-select path.** The sidebar foot (beside Settings) carries a
+`Select sessions` button (accessible name `Select sessions`):
+
+1. Click it; the selection manager lists every session with a persisted log,
+   with checkboxes, a running badge, and `Select all` / `Clear` actions.
+2. Blank New Session rows (nothing persisted yet) and the session currently
+   being viewed are excluded — the latter by rule, because deleting the very
+   session that issued the batch would abort the client that reports the
+   outcome. It stays deletable through its own single-session dialog.
+3. `Delete N selected` opens one confirmation listing the chosen sessions
+   (first six, then `…and N more.`) behind the same consent checkbox.
+4. The host deletes the sessions one at a time. The dialog reports
+   `K of N deleted; M failed.` with the per-session reason and **stays open
+   with only the failed sessions** armed, so `Delete permanently` retries
+   exactly those and never re-sends an id that already succeeded.
+5. On success the selection is cleared, the manager closes, and the list
+   refreshes in place.
+
 **Request contract.** The handler itself was invoked directly and returned exactly
 this (a unit-level run that bypasses the host's transport):
 
@@ -182,6 +200,20 @@ content-type: application/json
 {"sessionId":"<uuid>","confirm":true}
 ```
 
+For several sessions, the same path accepts the batch form, answered with the
+per-item results in request order:
+
+```
+{"sessionIds":["<uuid>","session-<uuid>"],"confirm":true}
+
+{"ok":true,"total":2,"succeeded":2,"failed":0,
+ "results":[{"ok":true,"id":"…","log":true,"cache":true,"ledger":true,"stage":"complete","error":""}, …]}
+```
+
+A batch is processed strictly sequentially (each purge mutates the same host
+primitives the next one verifies), a failing item does not stop the rest, and
+`ok` is true only when every item succeeded. At most 200 ids per request.
+
 | Condition | HTTP | Body |
 |---|---|---|
 | `origin` whose host differs from the request's `host` authority | 403 | `{"ok":false,"error":"cross-origin-request-rejected"}` |
@@ -189,8 +221,12 @@ content-type: application/json
 | `host` header absent or unparsable (nothing to bind against) | 403 | `{"ok":false,"error":"cross-origin-request-rejected"}` |
 | content-type not JSON | 415 | `{"ok":false,"error":"application-json-required"}` |
 | `confirm` missing or not `true` | 400 | `{"ok":false,"error":"sessionId-and-confirm-true-required"}` |
+| `sessionIds` missing, empty, over 200 entries, or with a non-string entry | 400 | `... "error":"sessionIds-must-be-1..200-strings"` |
+| `sessionIds` present with `confirm` not `true` | 400 | `... "error":"sessionIds-and-confirm-true-required"` |
 | malformed id | 400 | `... "error":"invalid-session-id: sessionId must be a UUID, optionally prefixed with \"session-\"."` |
 | valid id, host lacks capabilities | 501 | `... "stage":"stop-agent"` with a `runtime-capability-missing` message |
+| a batch where some item stayed live / lease-held | 409 | `... "ok":false, "failed":N` plus per-item `results` |
+| a batch where some item failed otherwise | 500 | `... "ok":false, "failed":N` plus per-item `results` |
 
 A browser always attaches `Origin` to a POST, and a same-origin one compares equal
 on host, so the GUI's own delete request is admitted. Through the running host,
@@ -210,14 +246,16 @@ http://127.0.0.1:13080` → 401 (fence passed, auth failed), foreign `Origin` �
 
 ```text
 src/
-  index.ts              # host half: session_purge tool + POST endpoint (start here)
+  index.ts              # host half: session_purge tool + POST endpoint, single and batch (start here)
   purge-core.ts         # ordered cleanup, pure and host-independent
   runtime-adapter.ts    # capability-detected bridge; every missing method fails closed
   client/
-    index.tsx           # slot injections, locale dictionaries (en, zh), confirm dialog
-    controller.ts       # UI state, POST call, in-place list refresh
+    index.tsx           # slot injections, locale dictionaries (en, zh), confirm dialog, selection manager
+    controller.ts       # UI state: single + multi-select, batch POST, in-place list refresh
 test/
-  purge-core.test.ts    # ordering and failure-path tests (7 tests)
+  purge-core.test.ts    # ordering, failure-path and batch tests (16 tests)
+  controller.test.ts    # client state machine tests (15 tests)
+  api-route.test.ts     # route, origin gate, capability and batch tests (35 tests)
 integration/
   README.md             # host capabilities required for real deletion
 cordis.patch.yml        # how the profile mounts this package (one insert row)
@@ -255,13 +293,14 @@ dsh plugin --profile <name> remove dsh-session-purge
 ## Testing
 
 Runner: vitest, invoked as `npm test`. There is no `vitest.config.*` file, so
-vitest's defaults pick up both files under `test/`.
+vitest's defaults pick up the three files under `test/`.
 
-Two layers:
+Three layers:
 
-- `test/purge-core.test.ts` drives `purgeSession` against a fake
-  `SessionPurgeRuntime` and asserts ordering, failure paths, signal
-  propagation, and what the raw-error observer receives.
+- `test/purge-core.test.ts` drives `purgeSession` and `purgeSessions` against a
+  fake `SessionPurgeRuntime` and asserts ordering, failure paths, signal
+  propagation, the abort classification, and what the raw-error observer
+  receives.
 - `test/api-route.test.ts` loads the plugin through a **real cordis Context**
   (a host fiber provides `tools`/`connection` plus host-shaped services; the
   plugin fiber then runs `apply`, exactly as the host loads plugins). A
@@ -269,15 +308,20 @@ Two layers:
   with, because its property reads never threw; the topology fixture cannot.
   The host shapes mirror the measured `0.2.0-rc.2` services, so the capability
   detection is asserted against what this host actually exposes.
+- `test/controller.test.ts` drives the client `SessionPurgeController` against a
+  stubbed `fetch`: the dialog invariants (no open while busy, retry of only the
+  failed remainder, current-session exclusion, selection-rows resolution, and
+  that a truncated results array cannot drop an item from the retry set).
 
 What success looks like (observed):
 
 ```text
- ✓ test/purge-core.test.ts (9 tests) 9ms
- ✓ test/api-route.test.ts (13 tests) 103ms
+ ✓ test/purge-core.test.ts (16 tests) 19ms
+ ✓ test/controller.test.ts (15 tests) 67ms
+ ✓ test/api-route.test.ts (35 tests) 545ms
 
- Test Files  2 passed (2)
-      Tests  22 passed (22)
+ Test Files  3 passed (3)
+       Tests  66 passed (66)
 ```
 
 Exit code 0 on pass (observed). A failing assertion is reported per test by vitest

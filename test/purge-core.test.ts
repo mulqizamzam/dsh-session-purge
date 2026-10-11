@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
-import { normalizeSessionId, purgeSession, SessionPurgeError, type SessionPurgeRuntime } from '../src/purge-core.ts'
+import { normalizeSessionId, purgeSession, purgeSessions, SessionPurgeError, type SessionPurgeRuntime } from '../src/purge-core.ts'
 
 const ID = '2de8b71d-bd3b-4f4d-8d1d-5dceac76f934'
+const ID2 = '8f14e45f-ceea-467a-9f1b-2c3d4e5f6a7b'
 
 function runtime(overrides: Partial<SessionPurgeRuntime> = {}) {
   const calls: string[] = []
@@ -102,5 +103,90 @@ describe('purgeSession', () => {
     const result = await purgeSession(adapter, ID, undefined, error => { observed.push(error) })
     expect(result.error).toBe('runtime-capability-missing: no delete primitive')
     expect(observed).toEqual([])
+  })
+
+  // A cancelled purge is neither a host defect nor a provider failure: it
+  // answers with its own code and reaches no observer, so an aborted request
+  // stops polluting the host log with "unexpected failure" lines.
+  it('classifies an abort instead of reporting unexpected-error', async () => {
+    const abort = Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })
+    const { runtime: adapter } = runtime({ deleteLog: async () => { throw abort } })
+    const observed: unknown[] = []
+    const result = await purgeSession(adapter, ID, undefined, error => { observed.push(error) })
+    expect(result.error).toContain('aborted:')
+    expect(result.stage).toBe('delete-log')
+    expect(result.ok).toBe(false)
+    expect(observed).toEqual([])
+  })
+})
+
+describe('purgeSessions', () => {
+  it('purges every id in request order and reports per-item results', async () => {
+    const seen: string[] = []
+    const { runtime: adapter } = runtime({ deleteLog: async id => { seen.push(id) } })
+    const batch = await purgeSessions(adapter, [ID, `session-${ID2}`])
+    expect(batch).toMatchObject({ ok: true, total: 2, succeeded: 2, failed: 0 })
+    expect(seen).toEqual([ID, `session-${ID2}`])
+    expect(batch.results.map(result => result.ok)).toEqual([true, true])
+  })
+
+  // The point of a batch: one item failing must not abort the rest, or the
+  // operator cannot tell which of N sessions were actually removed.
+  it('isolates a failing item and continues with the rest', async () => {
+    const deleted: string[] = []
+    const { runtime: adapter } = runtime({
+      deleteLog: async id => {
+        deleted.push(id)
+        if (id === ID2) throw new Error('jsonl artifact locked by another process')
+      },
+    })
+    const batch = await purgeSessions(adapter, [ID, ID2, ID])
+    expect(deleted).toEqual([ID, ID2, ID])
+    expect(batch.ok).toBe(false)
+    expect(batch.total).toBe(3)
+    expect(batch.succeeded).toBe(2)
+    expect(batch.failed).toBe(1)
+    expect(batch.results[1].ok).toBe(false)
+    expect(batch.results[1].error).toContain('unexpected-error')
+  })
+
+  it('reports onLogDeleted only for ids whose log is confirmed gone', async () => {
+    const announced: string[] = []
+    const { runtime: adapter } = runtime({
+      logIsAbsent: async id => id !== ID2,
+    })
+    const batch = await purgeSessions(adapter, [ID, ID2], undefined, undefined, async id => { announced.push(id) })
+    expect(batch.succeeded).toBe(1)
+    expect(announced).toEqual([ID])
+  })
+
+  it('answers ok:false for an empty batch instead of a false success', async () => {
+    const { runtime: adapter } = runtime()
+    const batch = await purgeSessions(adapter, [])
+    expect(batch.ok).toBe(false)
+    expect(batch.total).toBe(0)
+    expect(batch.results).toEqual([])
+  })
+
+  it('never starts a further item once the request is aborted', async () => {
+    const controller = new AbortController()
+    const abort = Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })
+    const deleted: string[] = []
+    const { runtime: adapter } = runtime({
+      deleteLog: async id => {
+        deleted.push(id)
+        controller.abort()
+        throw abort
+      },
+    })
+    const batch = await purgeSessions(adapter, [ID, ID2], controller.signal)
+    // The first item is cancelled mid-delete; the second fails its pre-stage
+    // abort check and never reaches any host lifecycle step.
+    expect(deleted).toEqual([ID])
+    expect(batch.results.map(result => result.error)).toEqual([
+      expect.stringContaining('aborted:'),
+      expect.stringContaining('aborted:'),
+    ])
+    expect(batch.succeeded).toBe(0)
   })
 })

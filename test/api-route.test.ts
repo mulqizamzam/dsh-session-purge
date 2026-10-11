@@ -3,6 +3,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../src/index.ts'
 
 const ID = '2de8b71d-bd3b-4f4d-8d1d-5dceac76f934'
+const ID2 = '8f14e45f-ceea-467a-9f1b-2c3d4e5f6a7b'
 const PATH = '/api/session-purge/delete'
 
 type RegisteredRoute = {
@@ -636,6 +637,210 @@ describe('the host session list is told the id is gone', () => {
       expect(harness.removed).toEqual([])
     } finally {
       await harness.dispose()
+    }
+  })
+})
+
+describe('POST /api/session-purge/delete batch form', () => {
+  /** Two-id capable persistence, mirroring the single-id fixture's shapes. */
+  function batchCapablePersistence(deleted: string[]): Record<string, object> {
+    return {
+      agents: { get: () => undefined, list: () => [] },
+      sessions: { get: () => undefined, list: () => [], flush: async () => true },
+      sessionPersistence: {
+        delete: async (id: string) => { deleted.push(id) },
+        stat: async () => undefined,
+        listSync: () => [] as readonly { id?: string }[],
+      },
+      sessionProjectionCache: { purge: async () => true },
+      workspaceRegistry: { releaseSession: async () => {} },
+    }
+  }
+
+  /** Persistence where one nominated id survives deletion (stat still sees it). */
+  function partiallySurvivingPersistence(deleted: string[], survivor: string): Record<string, object> {
+    return {
+      agents: { get: () => undefined, list: () => [] },
+      sessions: { get: () => undefined, list: () => [], flush: async () => true },
+      sessionPersistence: {
+        delete: async (id: string) => { deleted.push(id) },
+        stat: async (id: string) => (id === survivor ? { header: { id } } : undefined),
+        listSync: () => [] as readonly { id?: string }[],
+      },
+      sessionProjectionCache: { purge: async () => true },
+      workspaceRegistry: { releaseSession: async () => {} },
+    }
+  }
+
+  async function postBatch(route: RegisteredRoute, body: unknown, headers: Record<string, string> = {
+    host: '127.0.0.1:13080',
+    origin: 'http://127.0.0.1:13080',
+  }) {
+    const response = await route.fetch(browserRequest(body, headers))
+    return { status: response.status, payload: await response.json() as Record<string, unknown> }
+  }
+
+  it('deletes every id of a batch and answers the per-item results', async () => {
+    const deleted: string[] = []
+    const { routes } = await opened(batchCapablePersistence(deleted))
+    const { status, payload } = await postBatch(routes[0], { sessionIds: [ID, ID2], confirm: true })
+    expect(status).toBe(200)
+    expect(payload).toMatchObject({
+      ok: true,
+      total: 2,
+      succeeded: 2,
+      failed: 0,
+      results: [{ ok: true, id: ID }, { ok: true, id: ID2 }],
+    })
+    expect(deleted).toEqual([ID, ID2])
+  })
+
+  // Regression guard for the batch contract: one item whose log survives must
+  // not stop the loop, must not let the response claim overall success, and
+  // must leave the cache/ledger of THAT item untouched.
+  it('isolates a surviving item: the rest delete, the batch reports failure', async () => {
+    const deleted: string[] = []
+    const cachePurged: string[] = []
+    const ledgerReleased: string[] = []
+    const services = partiallySurvivingPersistence(deleted, ID2)
+    ;(services.sessionProjectionCache as { purge: (id: string) => Promise<boolean> }).purge = async (id: string) => { cachePurged.push(id); return true }
+    ;(services.workspaceRegistry as { releaseSession: (id: string) => Promise<void> }).releaseSession = async (id: string) => { ledgerReleased.push(id) }
+    const { routes } = await opened(services)
+    const { status, payload } = await postBatch(routes[0], { sessionIds: [ID, ID2], confirm: true })
+    expect(status).toBe(500)
+    expect(payload.ok).toBe(false)
+    expect(payload).toMatchObject({ total: 2, succeeded: 1, failed: 1 })
+    const results = payload.results as { ok: boolean; id: string; error?: string; stage?: string }[]
+    expect(results[0]).toMatchObject({ ok: true, id: ID })
+    expect(results[1]).toMatchObject({ ok: false, id: ID2, stage: 'verify-log' })
+    expect(results[1].error).toContain('log-not-absent')
+    // The surviving session's derived state is deliberately left alone.
+    expect(deleted).toEqual([ID, ID2])
+    expect(cachePurged).toEqual([ID])
+    expect(ledgerReleased).toEqual([ID])
+  })
+
+  it('announces and drops the read cache once per really-deleted id', async () => {
+    const deleted: string[] = []
+    const calls: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = ((input: string | URL | Request) => {
+      calls.push(String(input))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as typeof globalThis.fetch
+    try {
+      const harness = await install(batchCapablePersistence(deleted), 13080)
+      active.push(harness)
+      const { status } = await postBatch(harness.routes[0], { sessionIds: [ID, ID2], confirm: true })
+      expect(status).toBe(200)
+      expect(calls).toEqual([
+        'http://127.0.0.1:13080/plugin/session-readcache/purge',
+        'http://127.0.0.1:13080/plugin/session-readcache/purge',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('rejects a batch without confirm with its own error, touching nothing', async () => {
+    const deleted: string[] = []
+    const { routes } = await opened(batchCapablePersistence(deleted))
+    const { status, payload } = await postBatch(routes[0], { sessionIds: [ID], confirm: false })
+    expect(status).toBe(400)
+    expect(payload.error).toBe('sessionIds-and-confirm-true-required')
+    expect(deleted).toEqual([])
+  })
+
+  it('rejects malformed batches before any deletion', async () => {
+    const deleted: string[] = []
+    const { routes } = await opened(batchCapablePersistence(deleted))
+    for (const sessionIds of [[], [ID, 42], 'nope', Array.from({ length: 201 }, () => ID)]) {
+      const { status, payload } = await postBatch(routes[0], { sessionIds, confirm: true })
+      expect(status).toBe(400)
+      expect(typeof payload.error).toBe('string')
+    }
+    expect(deleted).toEqual([])
+  })
+
+  it('answers 400 when every id fails validation, and deletes nothing', async () => {
+    const deleted: string[] = []
+    const { routes } = await opened(batchCapablePersistence(deleted))
+    const { status, payload } = await postBatch(routes[0], { sessionIds: ['not-a-uuid', '../../sessions'], confirm: true })
+    expect(status).toBe(400)
+    const results = payload.results as { stage: string }[]
+    expect(results.map(result => result.stage)).toEqual(['validate', 'validate'])
+    expect(deleted).toEqual([])
+  })
+
+  it('treats a body with sessionIds as the batch form even when sessionId is also present', async () => {
+    const deleted: string[] = []
+    const { routes } = await opened(batchCapablePersistence(deleted))
+    const { status, payload } = await postBatch(routes[0], { sessionId: ID, sessionIds: [ID2], confirm: true })
+    expect(status).toBe(200)
+    expect(deleted).toEqual([ID2])
+    expect(payload.total).toBe(1)
+  })
+
+  it('keeps the single-id form answering the bare purge result', async () => {
+    const deleted: string[] = []
+    const { routes } = await opened(batchCapablePersistence(deleted))
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(200)
+    expect(payload).toMatchObject({ ok: true, id: ID, log: true, cache: true, ledger: true, stage: 'complete' })
+    // A single form never reports batch fields.
+    expect('total' in payload).toBe(false)
+  })
+
+  // The host's own lease check used to flatten into the sanitized
+  // `unexpected-error` string, which is factually correct and operationally
+  // useless: the one actionable fact (another writer still holds the session)
+  // never reached the operator.
+  it('maps the host write-lease refusal to an actionable 409', async () => {
+    const services = batchCapablePersistence([])
+    ;(services.sessionPersistence as { delete: (id: string) => Promise<void> }).delete = async () => {
+      throw Object.assign(new Error('jsonl artifact locked by another process'), { name: 'SessionAlreadyOwnedError' })
+    }
+    const { routes } = await opened(services)
+    const { status, payload } = await postBatch(routes[0], { sessionIds: [ID], confirm: true })
+    expect(status).toBe(409)
+    const results = payload.results as { error: string }[]
+    expect(results[0].error).toContain('session-write-lease-held')
+    expect(results[0].error).not.toContain('jsonl')
+    expect(results[0].error).not.toContain('unexpected-error')
+  })
+
+  // The removal announcement is a reporting side-channel: a listener on another
+  // plugin's context that throws must not rewrite a completed deletion into a
+  // reported failure, or a batch of real deletions would answer 500.
+  it('reports the completed batch even when a removal listener throws', async () => {
+    const routes: RegisteredRoute[] = []
+    const root = new Context()
+    const host = root.plugin({
+      name: 'throwing-forwarder',
+      apply(c) {
+        const reflect = c.reflect as unknown as { provide: (name: string, value: object) => void }
+        reflect.provide('tools', { register: () => {} })
+        reflect.provide('connection', {
+          fetch: { register: (route: RegisteredRoute) => { routes.push(route); return () => {} } },
+        })
+        const services = batchCapablePersistence([])
+        for (const [name, value] of Object.entries(services)) reflect.provide(name, value)
+        c.on('api-session/removed' as never, (() => { throw new Error('forwarder bridge down') }) as never)
+      },
+    })
+    await host
+    const plugin = root.plugin({ name: 'session-purge', inject: ['tools', 'connection'], apply })
+    await plugin
+    try {
+      const { status, payload } = await postBatch(routes[0], { sessionIds: [ID, ID2], confirm: true })
+      expect(status).toBe(200)
+      expect(payload).toMatchObject({ ok: true, total: 2, succeeded: 2 })
+    } finally {
+      await plugin.dispose()
+      await host.dispose()
     }
   })
 })
