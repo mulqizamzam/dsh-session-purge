@@ -255,7 +255,7 @@ src/
 test/
   purge-core.test.ts    # ordering, failure-path and batch tests (16 tests)
   controller.test.ts    # client state machine tests (15 tests)
-  api-route.test.ts     # route, origin gate, capability and batch tests (35 tests)
+  api-route.test.ts     # route, origin gate, capability, model-tool refusal and batch tests (36 tests)
 integration/
   README.md             # host capabilities required for real deletion
 cordis.patch.yml        # how the profile mounts this package (one insert row)
@@ -318,10 +318,10 @@ What success looks like (observed):
 ```text
  ✓ test/purge-core.test.ts (16 tests) 19ms
  ✓ test/controller.test.ts (15 tests) 67ms
- ✓ test/api-route.test.ts (35 tests) 545ms
+ ✓ test/api-route.test.ts (36 tests) 216ms
 
  Test Files  3 passed (3)
-       Tests  66 passed (66)
+       Tests  67 passed (67)
 ```
 
 Exit code 0 on pass (observed). A failing assertion is reported per test by vitest

@@ -845,6 +845,56 @@ describe('POST /api/session-purge/delete batch form', () => {
   })
 })
 
+describe('the agent-facing tool never authorizes deletion', () => {
+  /** Install like the host does, but capture the tool the plugin registers. */
+  async function installCapturingTool(services?: Record<string, object>): Promise<{
+    tool: { execute: (args: unknown) => Promise<Record<string, unknown>> }
+    deleted: string[]
+    dispose(): Promise<void>
+  }> {
+    let tool: { execute: (args: unknown) => Promise<Record<string, unknown>> } | undefined
+    const deleted: string[] = []
+    const root = new Context()
+    const host = root.plugin({
+      name: 'test-host',
+      apply(c) {
+        c.reflect.provide('tools', {
+          register: (registered: { execute: (args: unknown) => Promise<Record<string, unknown>> }) => { tool = registered },
+        })
+        c.reflect.provide('connection', { fetch: { register: () => () => {} } })
+        for (const [name, value] of Object.entries({ ...deleteCapablePersistence(deleted), ...services ?? {} })) {
+          c.reflect.provide(name, value)
+        }
+      },
+    })
+    await host
+    const plugin = root.plugin({ name: 'session-purge', inject: ['tools', 'connection'], apply })
+    await plugin
+    if (!tool) throw new Error('the plugin registered no tool')
+    return {
+      tool,
+      deleted,
+      dispose: async () => { await plugin.dispose(); await host.dispose() },
+    }
+  }
+
+  // The tool is model-supplied data, not human consent: `confirm: true` in an
+  // agent turn must never reach the purge pipeline. If this test ever fails,
+  // the irreversible-action gate has been opened to the model.
+  it('refuses even with confirm:true and deletes nothing', async () => {
+    const harness = await installCapturingTool()
+    try {
+      const result = await harness.tool.execute({ sessionId: ID, confirm: true })
+      expect(result.ok).toBe(false)
+      expect(result.stage).toBe('validate')
+      expect(String(result.error)).toContain('human-confirmation-required')
+      expect(harness.deleted).toEqual([])
+    } finally {
+      await harness.dispose()
+    }
+  })
+})
+
 describe('the host disposal bridge releases a live agent before deletion', () => {
   /** Live agent with no plugin-visible stop(), plus a host bridge that removes it. */
   function bridgeHost(closed: string[]): Record<string, object> {
