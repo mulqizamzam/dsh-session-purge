@@ -144,6 +144,25 @@ function sessionsSnapshot(rows: readonly { id: string; displayTitle: string; run
   }
 }
 
+/**
+ * The host's session hook is selector-first: calling it without a selector
+ * throws at runtime (measured live), so the stubs below accept one and answer
+ * through it — the component must pass an identity selector to get the whole
+ * snapshot.
+ */
+function useSessionsStub(rows: readonly { id: string; displayTitle: string; running?: boolean; blank?: boolean }[]) {
+  const snapshot = sessionsSnapshot(rows)
+  return (selector?: (value: unknown) => unknown) => {
+    // Mirror the measured runtime contract exactly: a call without a selector
+    // throws. A test stub that answered the no-arg call would pass code that
+    // the real host rejects — which is how this defect reached the browser.
+    if (typeof selector !== 'function') {
+      throw new Error('useSessions called without a selector; the host hook requires one at runtime')
+    }
+    return selector(snapshot)
+  }
+}
+
 function freshClient(): ClientHarness {
   return installClient()
 }
@@ -181,8 +200,8 @@ describe('client slot registration', () => {
 describe('the sidebar-foot selection entry', () => {
   it('renders an icon-only button when the sidebar is a rail, labelled otherwise', () => {
     const harness = freshClient()
-    const wide = mount(harness, 'session-purge-select', { wide: true, useSessions: () => sessionsSnapshot([]) })
-    const rail = mount(harness, 'session-purge-select', { wide: false, useSessions: () => sessionsSnapshot([]) })
+    const wide = mount(harness, 'session-purge-select', { wide: true, useSessions: useSessionsStub([]) })
+    const rail = mount(harness, 'session-purge-select', { wide: false, useSessions: useSessionsStub([]) })
     expect(wide.querySelector('button')?.getAttribute('aria-label')).toBe('Select sessions')
     expect(wide.textContent).toContain('Select sessions')
     expect(rail.querySelector('button')?.getAttribute('aria-label')).toBe('Select sessions')
@@ -194,7 +213,7 @@ describe('the sidebar-foot selection entry', () => {
     const harness = freshClient()
     const container = mount(harness, 'session-purge-select', {
       wide: true,
-      useSessions: () => sessionsSnapshot([
+      useSessions: useSessionsStub([
         { id: ID_A, displayTitle: 'alpha', running: true },
         { id: ID_B, displayTitle: '' },
         { id: ID_C, displayTitle: 'gamma', blank: true },
@@ -214,7 +233,7 @@ describe('the sidebar-foot selection entry', () => {
   it('refuses to open the manager over an open confirmation dialog', () => {
     const harness = freshClient()
     harness.controller.open(ID_A, 'alpha')
-    const container = mount(harness, 'session-purge-select', { wide: true, useSessions: () => sessionsSnapshot([]) })
+    const container = mount(harness, 'session-purge-select', { wide: true, useSessions: useSessionsStub([]) })
     clickButton(container, 'Select sessions')
     expect(harness.controller.getSnapshot().managerOpen).toBe(false)
   })

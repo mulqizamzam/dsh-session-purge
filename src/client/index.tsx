@@ -159,13 +159,18 @@ function SidebarMenuItem({ sessionId, displayTitle, useMenuOpenState, openConfir
 }
 
 function FooterSelectButton({ wide, useSessions, controller, t }: FooterProps) {
-  const sessions = useSessions() as SessionsSnapshot
+  // The host's selector hook requires a selector argument at runtime: the
+  // no-argument overload exists in the published type but throws in this host's
+  // implementation (measured live — the shipped CordisPanel footer occupant
+  // always passes one, and a no-arg call made this entry fail to render). The
+  // identity selector projects the whole snapshot.
+  const sessions = useSessions((state: unknown) => state) as SessionsSnapshot | undefined
   // Snapshot at click time: the manager then works from one stable list instead
   // of a moving one, and any id that disappears before confirm is reported as
   // a per-item failure rather than silently skipped.
   const rows = useMemo<readonly SessionRow[]>(() => {
-    const byId = sessions.byId ?? {}
-    return (sessions.ids ?? []).flatMap(id => {
+    const byId = sessions?.byId ?? {}
+    return (sessions?.ids ?? []).flatMap(id => {
       const row = byId[id]
       if (!row || row.blank === true) return []
       const sessionId = typeof row.id === 'string' && row.id.length > 0 ? row.id : id
