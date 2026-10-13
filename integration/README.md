@@ -42,7 +42,11 @@ Live evidence for the symptom these close: a host answering `{"ok":true,...,"sta
 2. Add a host-owned disposal operation that has the actual agent handle, drains it, and detaches the Session; plugin code cannot safely manufacture that capability.
 3. Implement a workspace/cache cascade owned by the host, or guarantee the named `purge`/release APIs.
 4. Keep the endpoint authenticated by the host's existing `connection.fetch` boundary and expose the route only to the web profile.
-5. Run the checks in the root README against both JSONL and SQLite backends, and test crash/partial-failure cases.
+5. Re-run the checks in the root README whenever a new `SessionPersistence` backend lands. Measured 2026-10-13: JSONL is the only concrete backend in this host (`packages/session/session-persistence-jsonl`), so "both backends" had no second target to test. The crash/partial-failure half of this item is already covered: `test/api-route.test.ts` (`partiallySurvivingPersistence`), `test/controller.test.ts` ("retries only the failed remainder of a partial batch"), and `test/purge-core.test.ts` ("still releases the ledger if cache cleanup fails after log deletion").
+
+### Derived stores that are not persistence backends (measured 2026-10-13)
+
+`session-query-sqlite` is a **query index over sessions**, not a second `SessionPersistence` backend, so `sessionPersistence.delete()` does not target it. It keeps `persisted_sessions` plus an FTS `persisted_docs` table keyed by `session_id`, and it converges on its own: every observation cycle computes `persistentDeletes = persistedRows.filter(row => !observation.persisted.has(row.id))` and deletes those rows inside the same `BEGIN IMMEDIATE` transaction. A session deleted by this plugin therefore leaves index rows only until the next observation cycle — this is read from the source, not measured live. Unlike the read cache it exposes no per-session purge call, so a deleted session stays searchable only for that window rather than permanently.
 
 ## Upstream references checked for this scaffold
 
