@@ -12,6 +12,7 @@ const DELETE_PATH = '/api/session-purge/delete'
 // built from the real clock too.
 const NOW = Date.now()
 const FIVE_DAYS_AGO = NOW - 5 * 86_400_000
+const ODD_AGE_AGO = NOW - Math.round(5.37 * 86_400_000)
 
 type RegisteredRoute = {
   path: string
@@ -25,7 +26,7 @@ interface Impact {
   createdAt: number | null
   ageDays: number | null
   sizeBytes: number | null
-  liveAgent: boolean
+  liveAgent: 'idle' | 'live' | 'unknown'
   attached: boolean
   deletable: boolean
   blockedReason: string
@@ -35,7 +36,12 @@ interface PreviewPayload {
   ok?: boolean
   error?: string
   results?: Impact[]
-  totalBytes?: number
+  totalBytes?: number | null
+}
+
+/** Every mutating primitive the purge pipeline uses, recorded by name. */
+interface Mutations {
+  readonly [primitive: string]: string[]
 }
 
 /** The host bridges /api requests against a synthetic base; request.url never carries this authority. */
@@ -49,7 +55,7 @@ function browserRequest(path: string, body: unknown, headers: Record<string, str
 
 interface Harness {
   routes: RegisteredRoute[]
-  deleted: string[]
+  mutations: Mutations
   dispose(): Promise<void>
 }
 
@@ -60,7 +66,10 @@ interface Harness {
  */
 async function install(services?: Record<string, object>): Promise<Harness> {
   const routes: RegisteredRoute[] = []
-  const deleted: string[] = []
+  const mutations: Record<string, string[]> = {}
+  const record = (primitive: string, id: string) => {
+    (mutations[primitive] ??= []).push(id)
+  }
   const root = new Context()
   const host = root.plugin({
     name: 'test-host',
@@ -84,7 +93,7 @@ async function install(services?: Record<string, object>): Promise<Harness> {
   await plugin
   return {
     routes,
-    deleted,
+    mutations,
     dispose: async () => {
       await plugin.dispose()
       await host.dispose()
@@ -92,28 +101,48 @@ async function install(services?: Record<string, object>): Promise<Harness> {
   }
 }
 
-/** A host that can report stored-session metadata and can delete (the delete must never be called). */
-function previewCapableHost(
-  snapshots: Record<string, { createdAt: number; sizeBytes?: number }>,
-  deleted: string[],
-  extra: Record<string, object> = {},
-): Record<string, object> {
-  return {
-    agents: { get: () => undefined, list: () => [] },
-    sessions: { get: () => undefined, list: () => [], flush: async () => true },
+interface HostOptions {
+  readonly snapshots?: Record<string, { createdAt: number; sizeBytes?: number }>
+  readonly agents?: object
+  readonly statThrows?: readonly string[]
+  readonly withoutAgentRegistry?: boolean
+}
+
+/**
+ * A host that can report stored-session metadata. Every mutating primitive the
+ * purge pipeline uses is recorded, so a test can prove that a preview touched
+ * none of them — not only `delete`.
+ */
+function previewCapableHost(options: HostOptions = {}): { services: Record<string, object>; mutations: Mutations } {
+  const mutations: Record<string, string[]> = {}
+  const record = (primitive: string, id: string) => {
+    (mutations[primitive] ??= []).push(id)
+  }
+  const snapshots = options.snapshots ?? {}
+  const statThrows = options.statThrows ?? []
+  const services: Record<string, object> = {
+    sessions: {
+      get: () => undefined,
+      list: () => [],
+      flush: async (session: unknown) => { record('sessions.flush', String(session)) },
+    },
     sessionPersistence: {
-      delete: async (id: string) => { deleted.push(id) },
+      delete: async (id: string) => { record('sessionPersistence.delete', id) },
       stat: async (id: string) => {
+        if (statThrows.includes(id)) throw new Error(`corrupt log for ${id}`)
         const entry = snapshots[id]
         if (!entry) return undefined
         return { header: { id, createdAt: entry.createdAt }, revision: 'rev-1', sizeBytes: entry.sizeBytes }
       },
       listSync: () => [] as readonly { id?: string }[],
     },
-    sessionProjectionCache: { purge: async () => true },
-    workspaceRegistry: { releaseSession: async () => {} },
-    ...extra,
+    sessionProjectionCache: { purge: async (id: string) => { record('sessionProjectionCache.purge', id); return true } },
+    workspaceRegistry: { releaseSession: async (id: string) => { record('workspaceRegistry.releaseSession', id) } },
   }
+  if (!options.withoutAgentRegistry) {
+    services.agents = options.agents ?? { get: () => undefined, list: () => [] }
+  }
+  return { services, mutations }
 }
 
 let active: Harness[] = []
@@ -137,14 +166,14 @@ const SAME_ORIGIN = { host: '127.0.0.1:13080', origin: 'http://127.0.0.1:13080' 
 
 describe('POST /api/session-purge/preview', () => {
   it('registers the preview route for POST only, beside the delete route', async () => {
-    const { routes } = await opened(previewCapableHost({}, []))
+    const { routes } = await opened(previewCapableHost().services)
     expect(routes.map(route => route.path)).toEqual([DELETE_PATH, PREVIEW_PATH])
     expect([...routes[1].methods]).toEqual(['POST'])
   })
 
   it('reports the stored size and age of a session', async () => {
-    const deleted: string[] = []
-    const { routes } = await opened(previewCapableHost({ [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 4096 } }, deleted))
+    const { services } = previewCapableHost({ snapshots: { [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 4096 } } })
+    const { routes } = await opened(services)
     const { status, payload } = await preview(routes[1], { sessionId: ID }, SAME_ORIGIN)
     expect(status).toBe(200)
     expect(payload.ok).toBe(true)
@@ -157,92 +186,150 @@ describe('POST /api/session-purge/preview', () => {
     expect(impact?.ageDays).toBeLessThan(5.1)
     expect(impact?.deletable).toBe(true)
     expect(impact?.blockedReason).toBe('')
+    expect(payload.totalBytes).toBe(4096)
+  })
+
+  it('rounds the age to one decimal', async () => {
+    const { services } = previewCapableHost({ snapshots: { [ID]: { createdAt: ODD_AGE_AGO, sizeBytes: 10 } } })
+    const { routes } = await opened(services)
+    const { payload } = await preview(routes[1], { sessionId: ID }, SAME_ORIGIN)
+    expect(payload.results?.[0]?.ageDays).toBe(5.4)
   })
 
   // The whole point of the route: it observes without touching anything.
-  it('never deletes, not even for a batch of deletable sessions', async () => {
-    const deleted: string[] = []
-    const { routes } = await opened(previewCapableHost({
-      [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 100 },
-      [ID2]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 200 },
-    }, deleted))
+  it('touches no mutating primitive, not even for a batch of deletable sessions', async () => {
+    const { services, mutations } = previewCapableHost({
+      snapshots: {
+        [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 100 },
+        [ID2]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 200 },
+      },
+    })
+    const { routes } = await opened(services)
     const { status } = await preview(routes[1], { sessionIds: [ID, ID2] }, SAME_ORIGIN)
     expect(status).toBe(200)
-    expect(deleted).toEqual([])
+    // Every primitive the purge pipeline uses, not only `delete`.
+    expect(mutations).toEqual({})
   })
 
   it('previews a batch in request order and totals the stored bytes', async () => {
-    const deleted: string[] = []
-    const { routes } = await opened(previewCapableHost({
-      [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 100 },
-      [ID2]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 250 },
-      [ID3]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 50 },
-    }, deleted))
+    const { services } = previewCapableHost({
+      snapshots: {
+        [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 100 },
+        [ID2]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 250 },
+        [ID3]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 50 },
+      },
+    })
+    const { routes } = await opened(services)
     const { payload } = await preview(routes[1], { sessionIds: [ID3, ID, ID2] }, SAME_ORIGIN)
     expect(payload.results?.map(impact => impact.id)).toEqual([ID3, ID, ID2])
     expect(payload.totalBytes).toBe(400)
   })
 
+  it('reports an unknown total as null, not as zero bytes', async () => {
+    const { services } = previewCapableHost({ snapshots: { [ID]: { createdAt: FIVE_DAYS_AGO } } })
+    const { routes } = await opened(services)
+    const { payload } = await preview(routes[1], { sessionId: ID }, SAME_ORIGIN)
+    expect(payload.totalBytes).toBeNull()
+  })
+
   it('reports a session with no stored log as nothing to remove', async () => {
-    const deleted: string[] = []
-    const { routes } = await opened(previewCapableHost({}, deleted))
+    const { services } = previewCapableHost()
+    const { routes } = await opened(services)
     const { status, payload } = await preview(routes[1], { sessionId: ID }, SAME_ORIGIN)
     expect(status).toBe(200)
-    expect(payload.results?.[0]).toMatchObject({ id: ID, exists: false, deletable: false, blockedReason: 'log-not-found' })
+    // No log is not a blocker: deleting an absent log is a successful no-op.
+    expect(payload.results?.[0]).toMatchObject({ id: ID, exists: false, deletable: false, blockedReason: '' })
   })
 
   it('reports a malformed id as invalid instead of failing the whole request', async () => {
-    const deleted: string[] = []
-    const { routes } = await opened(previewCapableHost({ [ID2]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 10 } }, deleted))
+    const { services } = previewCapableHost({ snapshots: { [ID2]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 10 } } })
+    const { routes } = await opened(services)
     const { status, payload } = await preview(routes[1], { sessionIds: ['not-a-uuid', ID2] }, SAME_ORIGIN)
     expect(status).toBe(200)
     expect(payload.results?.[0]).toMatchObject({ id: 'not-a-uuid', deletable: false, blockedReason: 'invalid-session-id' })
     expect(payload.results?.[1]).toMatchObject({ id: ID2, deletable: true })
   })
 
-  it('reports a live agent the host cannot dispose as blocked', async () => {
-    const deleted: string[] = []
-    const { routes } = await opened(previewCapableHost(
-      { [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 10 } },
-      deleted,
-      { agents: { get: () => ({}), list: () => [] } },
-    ))
+  it('isolates one unreadable log instead of failing the whole batch', async () => {
+    const { services } = previewCapableHost({
+      snapshots: { [ID2]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 20 } },
+      statThrows: [ID],
+    })
+    const { routes } = await opened(services)
+    const { status, payload } = await preview(routes[1], { sessionIds: [ID, ID2] }, SAME_ORIGIN)
+    expect(status).toBe(200)
+    expect(payload.results?.[0]).toMatchObject({ id: ID, blockedReason: 'stat-failed', deletable: false })
+    expect(payload.results?.[1]).toMatchObject({ id: ID2, blockedReason: '', deletable: true })
+  })
+
+  it('reports a live agent the host cannot stop as blocked', async () => {
+    const { services } = previewCapableHost({
+      snapshots: { [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 10 } },
+      agents: { get: () => ({}), list: () => [] },
+    })
+    const { routes } = await opened(services)
     const { payload } = await preview(routes[1], { sessionId: ID }, SAME_ORIGIN)
-    expect(payload.results?.[0]).toMatchObject({ liveAgent: true, deletable: false, blockedReason: 'session-live' })
+    expect(payload.results?.[0]).toMatchObject({ liveAgent: 'live', deletable: false, blockedReason: 'session-live' })
   })
 
   it('reports a live agent as deletable when the host can dispose it first', async () => {
-    const deleted: string[] = []
-    const { routes } = await opened(previewCapableHost(
-      { [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 10 } },
-      deleted,
-      { agents: { get: () => ({}), list: () => [] }, sessionController: { closeSession: async () => {} } },
-    ))
+    const { services } = previewCapableHost({
+      snapshots: { [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 10 } },
+      agents: { get: () => ({}), list: () => [] },
+    })
+    services.sessionController = { closeSession: async () => {} }
+    const { routes } = await opened(services)
     const { payload } = await preview(routes[1], { sessionId: ID }, SAME_ORIGIN)
-    expect(payload.results?.[0]).toMatchObject({ liveAgent: true, deletable: true, blockedReason: '' })
+    expect(payload.results?.[0]).toMatchObject({ liveAgent: 'live', deletable: true, blockedReason: '' })
+  })
+
+  it('reports a live agent as deletable when the agent itself can be stopped', async () => {
+    const { services } = previewCapableHost({
+      snapshots: { [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 10 } },
+      agents: { get: () => ({ stop: async () => {} }), list: () => [] },
+    })
+    const { routes } = await opened(services)
+    const { payload } = await preview(routes[1], { sessionId: ID }, SAME_ORIGIN)
+    // The purge's second success path: it stops the agent itself.
+    expect(payload.results?.[0]).toMatchObject({ liveAgent: 'live', deletable: true, blockedReason: '' })
+  })
+
+  // The preview must not be the optimistic path of a fail-closed plugin: on a
+  // host without the agent registry the delete answers 501, so the preview may
+  // not call that "deletable".
+  it('agrees with the delete route about a host with no agent registry', async () => {
+    const { services } = previewCapableHost({
+      snapshots: { [ID]: { createdAt: FIVE_DAYS_AGO, sizeBytes: 10 } },
+      withoutAgentRegistry: true,
+    })
+    const { routes } = await opened(services)
+    const { payload } = await preview(routes[1], { sessionId: ID }, SAME_ORIGIN)
+    expect(payload.results?.[0]).toMatchObject({ liveAgent: 'unknown', deletable: false, blockedReason: 'agent-registry-unavailable' })
+    const deletion = await routes[0].fetch(browserRequest(DELETE_PATH, { sessionId: ID, confirm: true }, SAME_ORIGIN))
+    expect(deletion.status).toBe(501)
   })
 
   it('refuses a foreign origin', async () => {
-    const deleted: string[] = []
-    const { routes } = await opened(previewCapableHost({ [ID]: { createdAt: FIVE_DAYS_AGO } }, deleted))
+    const { services, mutations } = previewCapableHost({ snapshots: { [ID]: { createdAt: FIVE_DAYS_AGO } } })
+    const { routes } = await opened(services)
     const { status, payload } = await preview(routes[1], { sessionId: ID }, {
       host: '127.0.0.1:13080',
       origin: 'http://evil.example',
     })
     expect(status).toBe(403)
     expect(payload.error).toBe('cross-origin-request-rejected')
-    expect(deleted).toEqual([])
+    expect(mutations).toEqual({})
   })
 
   it('refuses an unparsable origin', async () => {
-    const { routes } = await opened(previewCapableHost({}, []))
+    const { routes } = await opened(previewCapableHost().services)
     const { status, payload } = await preview(routes[1], { sessionId: ID }, { host: '127.0.0.1:13080', origin: 'not a url' })
     expect(status).toBe(403)
     expect(payload.error).toBe('invalid-origin')
   })
 
   it('requires a JSON content type', async () => {
-    const { routes } = await opened(previewCapableHost({}, []))
+    const { routes } = await opened(previewCapableHost().services)
     const response = await routes[1].fetch(new Request(new URL(PREVIEW_PATH, 'http://dsh.internal'), {
       method: 'POST',
       headers: { 'content-type': 'text/plain' },
@@ -253,14 +340,14 @@ describe('POST /api/session-purge/preview', () => {
   })
 
   it('rejects malformed JSON', async () => {
-    const { routes } = await opened(previewCapableHost({}, []))
+    const { routes } = await opened(previewCapableHost().services)
     const { status, payload } = await preview(routes[1], '{not json', SAME_ORIGIN)
     expect(status).toBe(400)
     expect(payload.error).toBe('invalid-json')
   })
 
   it('requires a session id in one of the two shapes', async () => {
-    const { routes } = await opened(previewCapableHost({}, []))
+    const { routes } = await opened(previewCapableHost().services)
     const { status, payload } = await preview(routes[1], {}, SAME_ORIGIN)
     expect(status).toBe(400)
     expect(payload.error).toBe('sessionId-or-sessionIds-required')

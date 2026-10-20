@@ -11,7 +11,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import { MenuItemButton } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, LocaleDictOf, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { SessionPurgeController, type SessionRow } from './controller.ts'
-import type { SessionImpact } from '../preview-core.ts'
+import type { PreviewReport } from '../preview-core.ts'
 
 const NS = 'session-purge'
 type LocaleKey =
@@ -19,7 +19,8 @@ type LocaleKey =
   | 'selectMode' | 'managerTitle' | 'managerEmpty' | 'managerHint' | 'selectAll' | 'clearSelection'
   | 'deleteSelected' | 'confirmBatch' | 'batchTitle' | 'batchMore'
   | 'running' | 'currentSession' | 'currentSessionNote' | 'retryHint'
-  | 'impactTitle' | 'impactAge' | 'impactTotal' | 'impactBlocked'
+  | 'impactTitle' | 'impactAge' | 'impactOldest' | 'impactTotal' | 'impactBlocked' | 'impactNothing'
+  | 'impactReasonLive' | 'impactReasonInvalid' | 'impactReasonRegistry' | 'impactReasonStat'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -53,8 +54,14 @@ const en: LocaleDictOf<typeof NS> = {
   retryHint: 'Retry sends only the sessions that failed.',
   impactTitle: 'What will be removed',
   impactAge: '{count} days old',
+  impactOldest: 'oldest {count} days old',
   impactTotal: '{count} sessions · {size} in total',
   impactBlocked: 'Cannot be removed now: {reason}',
+  impactNothing: 'No stored log — deleting it removes nothing.',
+  impactReasonLive: 'a live agent still holds it',
+  impactReasonInvalid: 'not a valid session id',
+  impactReasonRegistry: 'the host exposes no agent registry',
+  impactReasonStat: 'the host could not read its metadata',
 }
 const zh: LocaleDictOf<typeof NS> = {
   delete: '删除会话',
@@ -82,8 +89,14 @@ const zh: LocaleDictOf<typeof NS> = {
   retryHint: '重试只会重新提交失败的会话。',
   impactTitle: '将被删除的内容',
   impactAge: '已创建 {count} 天',
+  impactOldest: '最旧 {count} 天',
   impactTotal: '{count} 个会话 · 共 {size}',
   impactBlocked: '当前无法删除：{reason}',
+  impactNothing: '没有持久日志 —— 删除它不会移除任何内容。',
+  impactReasonLive: '仍有活动的 agent 占用它',
+  impactReasonInvalid: '不是有效的会话 id',
+  impactReasonRegistry: '宿主没有暴露 agent 注册表',
+  impactReasonStat: '宿主无法读取其元数据',
 }
 
 /**
@@ -302,32 +315,53 @@ function formatBytes(bytes: number | null): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+/** The host's reason codes, rendered in the operator's language, never as codes. */
+const REASON_KEYS: Record<string, LocaleKey> = {
+  'session-live': 'impactReasonLive',
+  'invalid-session-id': 'impactReasonInvalid',
+  'agent-registry-unavailable': 'impactReasonRegistry',
+  'stat-failed': 'impactReasonStat',
+}
+
 /**
  * What the pending deletion would remove: the stored size, how old it is, and
  * any session the host would refuse to delete right now. Purely informative —
  * the destructive button never depends on it.
  */
-function ImpactPanel({ impact, t }: { impact: readonly SessionImpact[]; t: OverlayProps['t'] }) {
-  if (impact.length === 0) return null
-  const totalBytes = impact.reduce((sum, item) => sum + (item.sizeBytes ?? 0), 0)
-  const ages = impact.map(item => item.ageDays).filter((age): age is number => age !== null)
-  const oldest = ages.length > 0 ? Math.round(Math.max(...ages)) : null
-  const blocked = impact.filter(item => item.blockedReason !== '')
-  const headline = impact.length === 1
-    ? formatBytes(impact[0].sizeBytes)
-    : t('impactTotal', { count: impact.length, size: formatBytes(totalBytes) })
+function ImpactPanel({ impact, t }: { impact: PreviewReport; t: OverlayProps['t'] }) {
+  const results = impact.results
+  if (results.length === 0) return null
+  const ages = results.map(item => item.ageDays).filter((age): age is number => age !== null)
+  const oldest = ages.length > 0 ? Math.max(...ages) : null
+  const blocked = results.filter(item => item.blockedReason !== '')
+  const empty = results.filter(item => item.blockedReason === '' && !item.exists)
+  const headline = results.length === 1
+    ? formatBytes(results[0].sizeBytes)
+    : t('impactTotal', {
+      count: results.length,
+      size: impact.totalBytes === null ? '—' : formatBytes(impact.totalBytes),
+    })
   return (
     <div style={{ margin: '0 0 14px', padding: '10px 12px', borderRadius: 10, background: 'var(--dsh-surface, rgba(0,0,0,0.05))' }}>
       <div style={{ fontSize: 12, opacity: 0.7 }}>{t('impactTitle')}</div>
       <div style={{ fontSize: 13, marginTop: 2 }}>
         {headline}
-        {oldest !== null && ` · ${t('impactAge', { count: oldest })}`}
+        {oldest !== null && ` · ${results.length === 1
+          ? t('impactAge', { count: oldest })
+          : t('impactOldest', { count: oldest })}`}
       </div>
-      {blocked.map(item => (
-        <div key={item.id} style={{ fontSize: 12, color: 'var(--dsh-danger, #c33)' }}>
-          {t('impactBlocked', { reason: item.blockedReason })}
-        </div>
+      {empty.map((item, index) => (
+        <div key={`empty-${String(index)}`} style={{ fontSize: 12, opacity: 0.7 }}>{t('impactNothing')}</div>
       ))}
+      {blocked.map((item, index) => {
+        const reasonKey = REASON_KEYS[item.blockedReason]
+        const reason = reasonKey === undefined ? item.blockedReason : t(reasonKey)
+        return (
+          <div key={`blocked-${String(index)}`} style={{ fontSize: 12, color: 'var(--dsh-danger, #c33)' }}>
+            {t('impactBlocked', { reason })}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -374,7 +408,7 @@ function ConfirmOverlay({ controller, t }: OverlayProps) {
               </ul>
             </>
           )}
-        {state.impact !== null && state.impact.length > 0 && <ImpactPanel impact={state.impact} t={t} />}
+        {state.impact !== null && <ImpactPanel impact={state.impact} t={t} />}
         <p>{t('body')}</p>
         <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '16px 0' }}>
           <input type="checkbox" checked={acknowledged} disabled={state.busy} onChange={event => setAcknowledgedToken(event.target.checked ? token : null)} />

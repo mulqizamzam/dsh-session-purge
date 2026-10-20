@@ -76,7 +76,7 @@ Response:
       "createdAt": 1760000000000,
       "ageDays": 5,
       "sizeBytes": 4096,
-      "liveAgent": false,
+      "liveAgent": "idle",
       "attached": false,
       "deletable": true,
       "blockedReason": ""
@@ -88,15 +88,25 @@ Response:
 
 - `createdAt` is epoch milliseconds and `ageDays` is derived from it;
   `sizeBytes` is the physical artifact size the host's `sessionPersistence.stat()`
-  reports. A host that does not expose `stat()` answers HTTP 501 with
-  `runtime-capability-missing`, and the delete path is unaffected.
-- `blockedReason` is `''` when the deletion can proceed, `log-not-found` when the
-  session has no stored log, `session-live` when a live agent holds it and the host
-  exposes no disposal bridge, and `invalid-session-id` for a malformed id. A
-  malformed id is reported per item instead of failing the whole request: the
-  preview is a report, so one unusable id must not hide the others.
+  reports. `totalBytes` is `null` when no size could be read — never `0`, which
+  would claim the sessions hold nothing. A host that does not expose `stat()`
+  answers HTTP 501 with `runtime-capability-missing`, and the delete path is
+  unaffected.
+- `liveAgent` is `idle`, `live`, or `unknown`. `unknown` means the host exposes
+  no agent registry at all — exactly the host on which the delete route answers
+  501 — so the preview says that instead of calling the session deletable.
+- `blockedReason` is `''` when nothing blocks the deletion, and otherwise one of
+  `invalid-session-id` (a malformed id), `session-live` (a live agent the host
+  can neither dispose nor stop), `agent-registry-unavailable` (the host exposes
+  no agent registry) or `stat-failed` (the host could not read this log). A
+  session with no stored log is not a blocker: `exists: false` says it, and
+  deleting an absent log is a successful no-op. A malformed or unreadable id is
+  reported per item instead of failing the whole request, so one unusable id
+  cannot hide the others.
 - The panel is advisory. When the preview cannot be read, the dialog still
-  deletes — only the consent checkbox gates the destructive button.
+  deletes — only the consent checkbox gates the destructive button. After a
+  partial batch failure the panel is read again for the pending remainder, so it
+  never describes sessions that are already gone.
 
 ## Compatibility notes (verified against DSH `0.2.0-rc.2`)
 
@@ -310,10 +320,10 @@ src/
     controller.ts       # UI state: single + multi-select, impact preview, batch POST, in-place list refresh
 test/
   purge-core.test.ts    # ordering, failure-path and batch tests (16 tests)
-  controller.test.ts    # client state machine tests (15 tests)
+  controller.test.ts    # client state machine tests (17 tests)
   api-route.test.ts     # route, origin gate, capability, model-tool refusal and batch tests (36 tests)
-  client-ui.test.ts     # jsdom mount of the real components, real events (17 tests)
-  preview.test.ts       # read-only preview route: impact, fences, and that it never deletes (14 tests)
+  client-ui.test.ts     # jsdom mount of the real components, real events (19 tests)
+  preview.test.ts       # read-only preview route: impact, fences, isolation, and that it mutates nothing (19 tests)
 integration/
   README.md             # host capabilities required for real deletion
 cordis.patch.yml        # how the profile mounts this package (one insert row)
@@ -380,20 +390,23 @@ Five layers:
 - `test/preview.test.ts` drives the read-only preview route through a real cordis
   Context like the delete suite: the impact record (size, age, live agent, blocked
   reason), the origin and content-type fences, the 501 when the host cannot report
-  stored metadata, and the proof that a preview of a deletable batch calls
-  `sessionPersistence.delete` zero times.
+  stored metadata, the per-item isolation of one unreadable log, the one-decimal
+  age rounding, and two agreements with the delete route — that a preview agrees
+  with a 501 delete on a host without the agent registry, and that a preview of a
+  deletable batch calls **no** mutating primitive (`delete`, `closeSession`,
+  `flush`, `purge`, `releaseSession` are all recorded and all stay empty).
 
 What success looks like (observed):
 
 ```text
- ✓ test/purge-core.test.ts (16 tests) 25ms
- ✓ test/controller.test.ts (15 tests) 153ms
- ✓ test/preview.test.ts (14 tests) 914ms
- ✓ test/api-route.test.ts (36 tests) 1486ms
- ✓ test/client-ui.test.ts (17 tests) 3163ms
+ ✓ test/purge-core.test.ts (16 tests) 43ms
+ ✓ test/controller.test.ts (17 tests) 154ms
+ ✓ test/preview.test.ts (19 tests) 672ms
+ ✓ test/api-route.test.ts (36 tests) 812ms
+ ✓ test/client-ui.test.ts (19 tests) 427ms
 
  Test Files  5 passed (5)
-      Tests  98 passed (98)
+      Tests  107 passed (107)
 ```
 
 Exit code 0 on pass (observed). A failing assertion is reported per test by vitest
@@ -507,6 +520,12 @@ Notes:
   with nothing deleted.
 - **Never replace the capability checks with direct file deletion.** Persistence can
   hold in-memory indexes and recreate a removed artifact; see `integration/README.md`.
+- **The preview route is a metadata-read surface.** It needs no `confirm` because it
+  deletes nothing, and like the delete route it admits a request that carries no
+  `Origin` header, so a local non-browser process can ask which sessions exist,
+  how large they are, how old they are, and whether a live agent holds them. That
+  is a smaller exposure than the delete route it sits beside, but it is a new one;
+  keep the route behind the same host boundary as the delete route.
 - **`.gitignore` keeps the dangerous and the generated out of the repository**:
   `node_modules/`, `lib/` (needed on disk for a `link:` install, but regenerated by
   `npm run build`), the `*:Zone.Identifier` sidecars that arrived with a
@@ -524,8 +543,10 @@ No, by design. `confirm: true` from the model is data, not proof of consent.
 
 **What does the dialog show before I confirm?**
 What the deletion would remove: the stored size, how old the session is, and any
-session the host would refuse to delete right now (a live agent with no disposal
-bridge). The panel is informational — if the host cannot answer, the dialog still
+session the host would refuse to delete right now (a live agent the host can
+neither dispose nor stop, an unreadable log, a host without an agent registry).
+A session with no stored log is reported as such — deleting it removes nothing and
+succeeds. The panel is informational: if the host cannot answer, the dialog still
 deletes, and only the consent checkbox gates the destructive button.
 
 **Does the preview delete anything?**
@@ -557,7 +578,7 @@ cannot prove compatibility, so check your runtime yourself with
 - [ ] You cloned this repository and `cd` into it
 - [ ] `npm install` completed against a registry that publishes `@deepseek-ai/*`
 - [ ] `npm run type-check` exited 0 with no output
-- [ ] `npm test` reported `98 passed (98)`
+- [ ] `npm test` reported `107 passed (107)`
 - [ ] `npm run build` wrote `lib/index.js` and `lib/client.js`
 - [ ] `dsh plugin --profile <name> add link:.` completed
 - [ ] `dsh --profile <name> --dump-config` shows the `session-purge` row

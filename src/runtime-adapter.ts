@@ -2,7 +2,7 @@ import {
   SessionPurgeError,
   type SessionPurgeRuntime,
 } from './purge-core.ts'
-import type { SessionPreviewRuntime, StoredSessionSnapshot } from './preview-core.ts'
+import type { LiveAgentState, SessionPreviewRuntime, StoredSessionSnapshot } from './preview-core.ts'
 
 /**
  * Structural view of the optional services available in compatible DSH forks.
@@ -269,19 +269,27 @@ export function createPreviewAdapter(resolve: ServiceResolver): SessionPreviewRu
       const stat = persistence.stat as (id: string) => Promise<StoredSessionSnapshot | undefined>
       return await stat.call(persistence, id)
     },
-    hasLiveAgent(id) {
+    liveAgentState(id) {
+      const agents = resolve('agents')
+      if (!agents || typeof agents.get !== 'function') return 'unknown'
+      return agents.get(id) ? 'live' : 'idle'
+    },
+    canStopAndDrain(id) {
       const agents = resolve('agents')
       if (!agents || typeof agents.get !== 'function') return false
-      return Boolean(agents.get(id))
+      const agent = agents.get(id) as { stop?: () => unknown } | undefined
+      if (!agent) return true
+      // The same two success paths the purge adapter has: the host's own
+      // disposal bridge, or an agent that exposes stop(). Anything else would
+      // fail at the purge's stop-agent stage.
+      const controller = resolve('sessionController') as { closeSession?: unknown } | undefined
+      if (controller && typeof controller.closeSession === 'function') return true
+      return typeof agent.stop === 'function'
     },
     isAttached(id) {
       const sessions = resolve('sessions')
       if (!sessions || typeof sessions.get !== 'function') return false
       return Boolean(sessions.get(id))
-    },
-    canDisposeLiveSession() {
-      const controller = resolve('sessionController') as { closeSession?: unknown } | undefined
-      return typeof controller?.closeSession === 'function'
     },
   }
 }

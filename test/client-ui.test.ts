@@ -199,7 +199,8 @@ describe('client slot registration', () => {
       'selectMode', 'managerTitle', 'managerEmpty', 'managerHint', 'selectAll', 'clearSelection',
       'deleteSelected', 'confirmBatch', 'batchTitle', 'batchMore',
       'running', 'currentSession', 'currentSessionNote', 'retryHint',
-      'impactTitle', 'impactAge', 'impactTotal', 'impactBlocked',
+      'impactTitle', 'impactAge', 'impactOldest', 'impactTotal', 'impactBlocked', 'impactNothing',
+      'impactReasonLive', 'impactReasonInvalid', 'impactReasonRegistry', 'impactReasonStat',
     ]
     for (const key of required) {
       expect(typeof en[key], `en.${key}`).toBe('string')
@@ -439,9 +440,9 @@ describe('the impact panel', () => {
         id: ID_A,
         exists: true,
         createdAt: Date.now(),
-        ageDays: 5,
+        ageDays: 5.4,
         sizeBytes: 4096,
-        liveAgent: false,
+        liveAgent: 'idle',
         attached: false,
         deletable: true,
         blockedReason: '',
@@ -472,17 +473,18 @@ describe('the impact panel', () => {
     await flush()
     expect(container.textContent).toContain('What will be removed')
     expect(container.textContent).toContain('4.0 KB')
-    expect(container.textContent).toContain('5 days old')
+    expect(container.textContent).toContain('5.4 days old')
   })
 
-  it('names a session the host would refuse to delete right now', async () => {
+  it('names a session the host would refuse to delete right now, in the operator language', async () => {
     const harness = freshClient()
     const fetchMock = vi.fn(async (url: unknown) => {
       if (String(url).includes('/preview')) {
-        return new Response(JSON.stringify(impactPayload({ liveAgent: true, deletable: false, blockedReason: 'session-live' })), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        })
+        return new Response(JSON.stringify(impactPayload({
+          liveAgent: 'live',
+          deletable: false,
+          blockedReason: 'session-live',
+        })), { status: 200, headers: { 'content-type': 'application/json' } })
       }
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
     })
@@ -490,19 +492,113 @@ describe('the impact panel', () => {
     harness.controller.open(ID_A, 'alpha')
     const container = mount(harness, 'session-purge-dialog', {})
     await flush()
-    expect(container.textContent).toContain('Cannot be removed now: session-live')
+    expect(container.textContent).toContain('Cannot be removed now: a live agent still holds it')
+    // The raw machine code never reaches the operator.
+    expect(container.textContent).not.toContain('session-live')
+  })
+
+  it('reports a session with no stored log as nothing to remove, not as a blocker', async () => {
+    const harness = freshClient()
+    const fetchMock = vi.fn(async (url: unknown) => {
+      if (String(url).includes('/preview')) {
+        return new Response(JSON.stringify(impactPayload({
+          exists: false,
+          deletable: false,
+          sizeBytes: null,
+          blockedReason: '',
+        })), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    harness.controller.open(ID_A, 'alpha')
+    const container = mount(harness, 'session-purge-dialog', {})
+    await flush()
+    expect(container.textContent).toContain('No stored log')
+    expect(container.textContent).not.toContain('Cannot be removed now')
   })
 
   it('keeps the confirmation available when the impact cannot be read', async () => {
     const harness = freshClient()
-    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('Failed to fetch') }))
+    const fetchMock = vi.fn(async (url: unknown) => {
+      if (String(url).includes('/preview')) throw new Error('Failed to fetch')
+      return new Response(JSON.stringify({ ok: true, id: ID_A, log: true, cache: true, ledger: true, stage: 'complete', error: '' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
     harness.controller.open(ID_A, 'alpha')
     const container = mount(harness, 'session-purge-dialog', {})
     await flush()
     expect(container.textContent).not.toContain('What will be removed')
-    // The preview is advisory: the destructive button is still gated on consent alone.
+    // The preview is advisory: the destructive button is still gated on consent
+    // alone, and the deletion still goes out.
     act(() => { checkboxInputs(container)[0].click() })
     const deleteButton = [...container.querySelectorAll('button')].find(button => button.textContent?.includes('Delete permanently'))
     expect((deleteButton as HTMLButtonElement).disabled).toBe(false)
+    await act(async () => { (deleteButton as HTMLButtonElement).click() })
+    expect(deleteRequestBody(fetchMock)).toEqual({ sessionId: ID_A, confirm: true })
+  })
+
+  it('describes the pending remainder after a partial batch failure', async () => {
+    const harness = freshClient()
+    harness.controller.openManager([
+      { sessionId: ID_A, title: 'alpha', running: false },
+      { sessionId: ID_B, title: 'beta', running: false },
+    ])
+    harness.controller.selectAll()
+    harness.controller.openBatchFromManager()
+    const container = mount(harness, 'session-purge-dialog', {})
+
+    let call = 0
+    const fetchMock = vi.fn(async (url: unknown) => {
+      if (String(url).includes('/preview')) {
+        // The first answer describes the whole batch; the retry answer describes
+        // only the remainder.
+        const ids = call === 0 ? [ID_A, ID_B] : [ID_B]
+        return new Response(JSON.stringify({
+          ok: true,
+          results: ids.map(id => ({
+            id,
+            exists: true,
+            createdAt: Date.now(),
+            ageDays: 5,
+            sizeBytes: id === ID_A ? 4096 : 8192,
+            liveAgent: 'idle',
+            attached: false,
+            deletable: true,
+            blockedReason: '',
+          })),
+          totalBytes: ids.reduce((sum, id) => sum + (id === ID_A ? 4096 : 8192), 0),
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      call += 1
+      return new Response(JSON.stringify({
+        ok: false,
+        total: 2,
+        succeeded: 1,
+        failed: 1,
+        results: [
+          { ok: true, id: ID_A, log: true, cache: true, ledger: true, stage: 'complete', error: '' },
+          { ok: false, id: ID_B, log: false, cache: false, ledger: false, stage: 'stop-agent', error: 'session-still-live: the agent still appears in the registry' },
+        ],
+      }), { status: 409, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await flush()
+    expect(container.textContent).toContain('2 sessions')
+
+    act(() => { checkboxInputs(container)[0].click() })
+    const deleteButton = () => [...container.querySelectorAll('button')].find(button => button.textContent?.includes('permanently'))
+    await act(async () => { (deleteButton() as HTMLButtonElement).click() })
+    await flush()
+
+    // The succeeded session is gone; the panel must describe what is left:
+    // one session of 8.0 KB, not the 12.0 KB the whole batch held.
+    expect(container.textContent).toContain('1 of 2 deleted; 1 failed.')
+    expect(container.textContent).toContain('8.0 KB')
+    expect(container.textContent).not.toContain('12.0 KB')
+    expect(container.textContent).not.toContain('2 sessions')
   })
 })

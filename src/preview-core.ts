@@ -6,7 +6,7 @@
  * calls a removal primitive.
  */
 
-import { normalizeSessionId } from './purge-core.ts'
+import { normalizeSessionId, SessionPurgeError } from './purge-core.ts'
 
 /** The host's stored-session snapshot, read defensively. */
 export interface StoredSessionSnapshot {
@@ -14,15 +14,24 @@ export interface StoredSessionSnapshot {
   readonly sizeBytes?: number
 }
 
+/**
+ * What the host knows about a session's agent.
+ *
+ * `unknown` is not the same as `idle`: without the agent registry the purge
+ * pipeline cannot even look for a live agent, and it answers
+ * `runtime-capability-missing` for the whole deletion.
+ */
+export type LiveAgentState = 'idle' | 'live' | 'unknown'
+
 export interface SessionPreviewRuntime {
   /** The host's stored-session snapshot, or undefined when no log exists. */
   statSession(sessionId: string): Promise<StoredSessionSnapshot | undefined>
-  /** True when a live agent still holds this session. */
-  hasLiveAgent(sessionId: string): boolean
+  /** 'unknown' when the host exposes no agent registry at all. */
+  liveAgentState(sessionId: string): LiveAgentState
+  /** True when the purge pipeline could stop and drain this session's agent. */
+  canStopAndDrain(sessionId: string): boolean
   /** True when a live session is still attached. */
   isAttached(sessionId: string): boolean
-  /** True when the host can dispose a live session before its log is deleted. */
-  canDisposeLiveSession(): boolean
 }
 
 /** What one session's deletion would remove, and whether it can be removed now. */
@@ -36,24 +45,50 @@ export interface SessionImpact {
   readonly ageDays: number | null
   /** The stored artifact's physical size in bytes. */
   readonly sizeBytes: number | null
-  /** A live agent still holds this session. */
-  readonly liveAgent: boolean
-  /** A live session is still attached. */
+  readonly liveAgent: LiveAgentState
   readonly attached: boolean
   /** A successful delete would remove the stored log. */
   readonly deletable: boolean
-  /** '' when deletable, otherwise the reason code. */
+  /**
+   * '' when nothing blocks the deletion, otherwise the reason code:
+   * `invalid-session-id`, `session-live`, `agent-registry-unavailable` or
+   * `stat-failed`. A session with no stored log is not a blocker: deleting it
+   * is a successful no-op, which `exists: false` already says.
+   */
   readonly blockedReason: string
+}
+
+/** One preview answer: the per-session records and the bytes they hold. */
+export interface PreviewReport {
+  readonly results: readonly SessionImpact[]
+  /** The known total size, or null when no size could be read. */
+  readonly totalBytes: number | null
 }
 
 const MILLISECONDS_PER_DAY = 86_400_000
 
+function impact(id: string, extra: Partial<SessionImpact>): SessionImpact {
+  return {
+    id,
+    exists: false,
+    createdAt: null,
+    ageDays: null,
+    sizeBytes: null,
+    liveAgent: 'idle',
+    attached: false,
+    deletable: false,
+    blockedReason: '',
+    ...extra,
+  }
+}
+
 /**
  * Describe one session without touching it.
  *
- * A malformed id and a missing log are reported as reasons, not as failures:
- * the preview is a report, and one unusable id in a batch must not hide the
- * others.
+ * A malformed id and an unreadable log are reported as reasons, not as
+ * failures: the preview is a report, and one unusable id in a batch must not
+ * hide the others. A missing host capability is different — that is the host's
+ * answer about itself, so it fails the whole request instead.
  */
 export async function previewSession(
   runtime: SessionPreviewRuntime,
@@ -64,39 +99,35 @@ export async function previewSession(
   try {
     id = normalizeSessionId(rawId)
   } catch {
-    return {
-      id: rawId,
-      exists: false,
-      createdAt: null,
-      ageDays: null,
-      sizeBytes: null,
-      liveAgent: false,
-      attached: false,
-      deletable: false,
-      blockedReason: 'invalid-session-id',
-    }
+    return impact(rawId, { blockedReason: 'invalid-session-id' })
   }
-  const snapshot = await runtime.statSession(id)
+  let snapshot: StoredSessionSnapshot | undefined
+  try {
+    snapshot = await runtime.statSession(id)
+  } catch (error) {
+    if (error instanceof SessionPurgeError) throw error
+    return impact(id, { blockedReason: 'stat-failed' })
+  }
   if (snapshot === undefined) {
-    return {
-      id,
-      exists: false,
-      createdAt: null,
-      ageDays: null,
-      sizeBytes: null,
-      liveAgent: false,
-      attached: false,
-      deletable: false,
-      blockedReason: 'log-not-found',
-    }
+    // No stored log: nothing to remove, and the delete is a successful no-op.
+    return impact(id, {})
   }
-  const createdAt = typeof snapshot.header?.createdAt === 'number' ? snapshot.header.createdAt : null
-  const sizeBytes = typeof snapshot.sizeBytes === 'number' ? snapshot.sizeBytes : null
-  const liveAgent = runtime.hasLiveAgent(id)
+  const createdAt = typeof snapshot.header?.createdAt === 'number' && Number.isFinite(snapshot.header.createdAt)
+    ? snapshot.header.createdAt
+    : null
+  const sizeBytes = typeof snapshot.sizeBytes === 'number' && Number.isFinite(snapshot.sizeBytes)
+    ? snapshot.sizeBytes
+    : null
+  const liveAgent = runtime.liveAgentState(id)
   const attached = runtime.isAttached(id)
-  // A live agent blocks the purge unless the host can dispose it first — the
-  // same rule the delete pipeline applies at its stop-agent stage.
-  const blockedReason = liveAgent && !runtime.canDisposeLiveSession() ? 'session-live' : ''
+  let blockedReason = ''
+  if (liveAgent === 'unknown') {
+    // The purge pipeline cannot look for a live agent without this registry and
+    // answers 501 for it; the preview must not call that "deletable".
+    blockedReason = 'agent-registry-unavailable'
+  } else if (liveAgent === 'live' && !runtime.canStopAndDrain(id)) {
+    blockedReason = 'session-live'
+  }
   return {
     id,
     exists: true,
@@ -109,5 +140,29 @@ export async function previewSession(
     attached,
     deletable: blockedReason === '',
     blockedReason,
+  }
+}
+
+/**
+ * Collect the impact of several sessions.
+ *
+ * One unreadable log is reported as that session's reason; the others are
+ * still described. A missing host capability still fails the whole request.
+ */
+export async function previewSessions(
+  runtime: SessionPreviewRuntime,
+  rawIds: readonly string[],
+  now: number = Date.now(),
+): Promise<PreviewReport> {
+  const results: SessionImpact[] = []
+  for (const rawId of rawIds) {
+    results.push(await previewSession(runtime, rawId, now))
+  }
+  const known = results.filter(item => item.sizeBytes !== null)
+  return {
+    results,
+    // null, not 0, when no size is known: "0 bytes" would claim the sessions
+    // hold nothing.
+    totalBytes: known.length === 0 ? null : known.reduce((sum, item) => sum + (item.sizeBytes ?? 0), 0),
   }
 }

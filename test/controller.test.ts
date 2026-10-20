@@ -126,6 +126,45 @@ describe('SessionPurgeController — dialog invariants', () => {
     settle(jsonResponse(okResult(ID_A)))
     await inFlight
   })
+
+  it('drops a preview answer whose dialog was replaced', async () => {
+    let call = 0
+    stubFetch(async () => {
+      call += 1
+      return jsonResponse({
+        ok: true,
+        results: [{
+          id: call === 1 ? ID_A : ID_B,
+          exists: true,
+          createdAt: 0,
+          ageDays: 1,
+          sizeBytes: 10,
+          liveAgent: 'idle',
+          attached: false,
+          deletable: true,
+          blockedReason: '',
+        }],
+        totalBytes: 10,
+      })
+    })
+    const controller = new SessionPurgeController(async () => {})
+    controller.open(ID_A, 'alpha')
+    controller.open(ID_B, 'beta')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    // The first answer belongs to a dialog that no longer exists.
+    expect(controller.getSnapshot().impact?.results[0].id).toBe(ID_B)
+  })
+
+  it('drops a preview answer that arrives after its dialog closed', async () => {
+    let settle: (response: Response) => void = () => {}
+    stubFetch(() => new Promise<Response>(resolve => { settle = resolve }))
+    const controller = new SessionPurgeController(async () => {})
+    controller.open(ID_A, 'alpha')
+    controller.close()
+    settle(jsonResponse({ ok: true, results: [], totalBytes: 0 }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(controller.getSnapshot().impact).toBeNull()
+  })
 })
 
 describe('SessionPurgeController — selection manager', () => {

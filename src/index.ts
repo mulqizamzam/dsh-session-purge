@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { purgeSession, purgeSessions, type PurgeResult } from './purge-core.ts'
-import { previewSession, type SessionImpact } from './preview-core.ts'
+import { previewSessions } from './preview-core.ts'
 import {
   createPreviewAdapter,
   createRuntimeAdapter,
@@ -223,18 +223,6 @@ async function purgeSessionListCache(ctx: Context): Promise<void> {
   }
 }
 
-/**
- * The read-only report: one impact record per session, plus the bytes they
- * hold in total.
- */
-function previewPayload(results: readonly SessionImpact[]) {
-  return {
-    ok: true,
-    results,
-    totalBytes: results.reduce((sum, impact) => sum + (impact.sizeBytes ?? 0), 0),
-  }
-}
-
 export function apply(ctx: Context): void {
   const resolved = new Map<string, object>()
   for (const name of OPTIONAL_SERVICES) {
@@ -390,16 +378,12 @@ export function apply(ctx: Context): void {
           ) {
             return json({ ok: false, error: `sessionIds-must-be-1..${String(MAX_BATCH_IDS)}-strings` }, 400)
           }
-          const results: SessionImpact[] = []
-          for (const rawId of input.sessionIds as readonly string[]) {
-            results.push(await previewSession(preview, rawId))
-          }
-          return json(previewPayload(results))
+          return json({ ok: true, ...await previewSessions(preview, input.sessionIds as readonly string[]) })
         }
         if (typeof input.sessionId !== 'string') {
           return json({ ok: false, error: 'sessionId-or-sessionIds-required' }, 400)
         }
-        return json(previewPayload([await previewSession(preview, input.sessionId)]))
+        return json({ ok: true, ...await previewSessions(preview, [input.sessionId]) })
       } catch (error) {
         logUnexpected(ctx, error, 'preview')
         const message = publicErrorMessage(error)

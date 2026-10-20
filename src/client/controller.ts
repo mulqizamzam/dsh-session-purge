@@ -1,6 +1,6 @@
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { BatchPurgeResult, PurgeResult } from '../purge-core.ts'
-import type { SessionImpact } from '../preview-core.ts'
+import type { PreviewReport } from '../preview-core.ts'
 
 const DELETE_PATH = '/api/session-purge/delete'
 const PREVIEW_PATH = '/api/session-purge/preview'
@@ -50,7 +50,7 @@ export interface PurgeUiState {
   readonly error: string | null
   readonly itemFailures: readonly ItemFailure[]
   /** What the pending deletion would remove; null until the host answers. */
-  readonly impact: readonly SessionImpact[] | null
+  readonly impact: PreviewReport | null
 }
 
 type Listener = () => void
@@ -184,10 +184,16 @@ export class SessionPurgeController {
         body: JSON.stringify({ sessionIds: ids }),
       })
       const raw = await response.text()
-      const payload = JSON.parse(raw) as { ok?: boolean; results?: SessionImpact[] }
+      const payload = JSON.parse(raw) as { ok?: boolean; results?: PreviewReport['results']; totalBytes?: number | null }
       if (!response.ok || payload.ok !== true || !Array.isArray(payload.results)) return
       if (this.state.target?.token !== token && this.state.batch?.token !== token) return
-      this.setState({ ...this.state, impact: payload.results })
+      this.setState({
+        ...this.state,
+        impact: {
+          results: payload.results,
+          totalBytes: typeof payload.totalBytes === 'number' ? payload.totalBytes : null,
+        },
+      })
     } catch {
       /* an unreadable impact must never block the deletion */
     }
@@ -231,6 +237,7 @@ export class SessionPurgeController {
         busy: false,
         error: null,
         itemFailures: [],
+        impact: null,
       }))
     } catch (error) {
       this.settle(token, () => ({
@@ -280,6 +287,7 @@ export class SessionPurgeController {
           busy: false,
           error: null,
           itemFailures: [],
+          impact: null,
           selected: this.state.selected.filter(id => !deleted.has(id)),
         })
         return
@@ -295,7 +303,12 @@ export class SessionPurgeController {
         batch: pending.length > 0 ? { items: pending, token } : null,
         error: summary,
         itemFailures: failures,
+        // The panel must describe the pending remainder, not the batch that was
+        // just deleted: the succeeded ids are already gone, and their bytes
+        // with them.
+        impact: null,
       })
+      if (pending.length > 0) void this.loadImpact(pending.map(item => item.sessionId), token)
     } catch (error) {
       this.settleBatch(token, () => ({
         ...this.state,
