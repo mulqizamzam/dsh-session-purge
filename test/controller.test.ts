@@ -28,7 +28,7 @@ afterEach(() => {
   for (const restore of installed.splice(0)) restore()
 })
 
-function stubFetch(handler: () => Promise<Response>): { fetchMock: ReturnType<typeof vi.fn> } {
+function stubFetch(handler: (url: unknown, init?: RequestInit) => Promise<Response>): { fetchMock: ReturnType<typeof vi.fn> } {
   const fetchMock = vi.fn(handler)
   const original = globalThis.fetch
   globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch
@@ -64,9 +64,19 @@ function answeringController(payload: unknown, status = 200) {
   }
 }
 
+/**
+ * The body of the LAST destructive request. Opening a dialog also asks the
+ * host what would be removed, so the delete request is found by its path.
+ */
 function postedBody(fetchMock: ReturnType<typeof vi.fn>): { sessionId?: string, sessionIds?: string[], confirm?: boolean } {
-  const init = fetchMock.mock.calls.at(-1)?.[1] as RequestInit | undefined
+  const call = fetchMock.mock.calls.filter(candidate => String(candidate[0]).includes('/delete')).at(-1)
+  const init = call?.[1] as RequestInit | undefined
   return JSON.parse(String(init?.body ?? '{}')) as { sessionId?: string, sessionIds?: string[], confirm?: boolean }
+}
+
+/** How many destructive requests were sent; the impact preview is not one of them. */
+function deleteCallCount(fetchMock: ReturnType<typeof vi.fn>): number {
+  return fetchMock.mock.calls.filter(candidate => String(candidate[0]).includes('/delete')).length
 }
 
 describe('SessionPurgeController — dialog invariants', () => {
@@ -112,7 +122,7 @@ describe('SessionPurgeController — dialog invariants', () => {
     controller.open(ID_A, 'alpha')
     const inFlight = controller.confirm()
     await controller.confirm()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(deleteCallCount(fetchMock)).toBe(1)
     settle(jsonResponse(okResult(ID_A)))
     await inFlight
   })
@@ -202,7 +212,11 @@ describe('SessionPurgeController — batch deletion', () => {
 
   it('retries only the failed remainder of a partial batch', async () => {
     let call = 0
-    const { fetchMock } = stubFetch(async () => {
+    const { fetchMock } = stubFetch(async (url: unknown) => {
+      // The dialog asks the host what would be removed before it asks it to delete.
+      if (String(url).includes('/preview')) {
+        return jsonResponse({ ok: true, results: [], totalBytes: 0 })
+      }
       call += 1
       return call === 1
         ? jsonResponse({

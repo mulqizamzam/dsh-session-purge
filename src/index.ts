@@ -1,7 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { purgeSession, purgeSessions, type PurgeResult } from './purge-core.ts'
+import { previewSession, type SessionImpact } from './preview-core.ts'
 import {
+  createPreviewAdapter,
   createRuntimeAdapter,
   publicErrorMessage,
   type ServiceResolver,
@@ -11,6 +13,7 @@ export const name = 'session-purge'
 export const inject = ['tools', 'connection']
 
 const DELETE_PATH = '/api/session-purge/delete'
+const PREVIEW_PATH = '/api/session-purge/preview'
 
 /**
  * Upper bound on one batch request. The client only ever sends ids it listed
@@ -86,6 +89,50 @@ function json(data: unknown, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
   })
+}
+
+/**
+ * The origin fence both routes share.
+ *
+ * `request.url` cannot name this deployment's authority: the host bridges
+ * /api requests through packages/client/connection/src/http-bridge.ts, which
+ * rebuilds each URL against the synthetic base `http://dsh.internal`, so its
+ * origin is never the browser's. The Host header is the authority the browser
+ * actually dialed and the one the host's own /api trust fence binds, so compare
+ * the two hosts. Scheme is deliberately not compared: behind a TLS-terminating
+ * proxy the page origin is `https:` while the Host header it forwards carries
+ * no scheme, and the host fence accepts that same pair.
+ * @returns a refusal response, or null when the request may proceed.
+ */
+function originFence(request: Request): Response | null {
+  const origin = request.headers.get('origin')
+  if (!origin) return null
+  const authority = hostAuthority(request.headers.get('host'))
+  let originHost: string
+  try {
+    originHost = new URL(origin).host
+  } catch {
+    return json({ ok: false, error: 'invalid-origin' }, 403)
+  }
+  if (authority === undefined || originHost !== authority) {
+    return json({ ok: false, error: 'cross-origin-request-rejected' }, 403)
+  }
+  return null
+}
+
+/** The JSON body both routes share: the content type, the parse, the shape. */
+async function jsonBody(request: Request): Promise<{ body: unknown } | { response: Response }> {
+  if (!request.headers.get('content-type')?.toLowerCase().includes('application/json')) {
+    return { response: json({ ok: false, error: 'application/json-required' }, 415) }
+  }
+  let body: unknown
+  try {
+    body = await request.json()
+  } catch {
+    return { response: json({ ok: false, error: 'invalid-json' }, 400) }
+  }
+  if (!body || typeof body !== 'object') return { response: json({ ok: false, error: 'invalid-request' }, 400) }
+  return { body }
 }
 
 function resultStatus(result: PurgeResult): number {
@@ -176,6 +223,18 @@ async function purgeSessionListCache(ctx: Context): Promise<void> {
   }
 }
 
+/**
+ * The read-only report: one impact record per session, plus the bytes they
+ * hold in total.
+ */
+function previewPayload(results: readonly SessionImpact[]) {
+  return {
+    ok: true,
+    results,
+    totalBytes: results.reduce((sum, impact) => sum + (impact.sizeBytes ?? 0), 0),
+  }
+}
+
 export function apply(ctx: Context): void {
   const resolved = new Map<string, object>()
   for (const name of OPTIONAL_SERVICES) {
@@ -186,6 +245,7 @@ export function apply(ctx: Context): void {
   }
   const resolve: ServiceResolver = name => resolved.get(name) as ReturnType<ServiceResolver>
   const runtime = createRuntimeAdapter(resolve)
+  const preview = createPreviewAdapter(resolve)
 
   ctx.tools.register(defineTool({
     name: 'session_purge',
@@ -234,39 +294,11 @@ export function apply(ctx: Context): void {
     requestBody: 'buffered',
     fetch: async request => {
       if (request.method !== 'POST') return json({ ok: false, error: 'method-not-allowed' }, 405)
-      const origin = request.headers.get('origin')
-      if (origin) {
-        // `request.url` cannot name this deployment's authority: the host bridges
-        // /api requests through packages/client/connection/src/http-bridge.ts,
-        // which rebuilds each URL against the synthetic base `http://dsh.internal`,
-        // so its origin is never the browser's. The Host header is the authority
-        // the browser actually dialed and the one the host's own /api trust fence
-        // binds, so compare the two hosts. Scheme is deliberately not compared:
-        // behind a TLS-terminating proxy the page origin is `https:` while the
-        // Host header it forwards carries no scheme, and the host fence accepts
-        // that same pair.
-        const authority = hostAuthority(request.headers.get('host'))
-        let originHost: string
-        try {
-          originHost = new URL(origin).host
-        } catch {
-          return json({ ok: false, error: 'invalid-origin' }, 403)
-        }
-        if (authority === undefined || originHost !== authority) {
-          return json({ ok: false, error: 'cross-origin-request-rejected' }, 403)
-        }
-      }
-      if (!request.headers.get('content-type')?.toLowerCase().includes('application/json')) {
-        return json({ ok: false, error: 'application/json-required' }, 415)
-      }
-      let body: unknown
-      try {
-        body = await request.json()
-      } catch {
-        return json({ ok: false, error: 'invalid-json' }, 400)
-      }
-      if (!body || typeof body !== 'object') return json({ ok: false, error: 'invalid-request' }, 400)
-      const input = body as { sessionId?: unknown; sessionIds?: unknown; confirm?: unknown }
+      const refused = originFence(request)
+      if (refused) return refused
+      const parsed = await jsonBody(request)
+      if ('response' in parsed) return parsed.response
+      const input = parsed.body as { sessionId?: unknown; sessionIds?: unknown; confirm?: unknown }
       // Batch first: a body carrying `sessionIds` is always the multi-session
       // form, even when it also carries `sessionId`. Both shapes share one path
       // so the origin/auth fence, the buffering policy and the purge pipeline
@@ -331,6 +363,47 @@ export function apply(ctx: Context): void {
       } catch (error) {
         logUnexpected(ctx, error, 'route')
         return json({ ok: false, error: publicErrorMessage(error) }, 500)
+      }
+    },
+  })
+
+  // The read-only half of the plugin: what a delete would remove, asked before
+  // the operator commits. It never calls a removal primitive, so it needs no
+  // `confirm` — the consent belongs to the destructive route alone.
+  connectionOf(ctx).fetch.register({
+    path: PREVIEW_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async request => {
+      if (request.method !== 'POST') return json({ ok: false, error: 'method-not-allowed' }, 405)
+      const refused = originFence(request)
+      if (refused) return refused
+      const parsed = await jsonBody(request)
+      if ('response' in parsed) return parsed.response
+      const input = parsed.body as { sessionId?: unknown; sessionIds?: unknown }
+      try {
+        if (Array.isArray(input.sessionIds)) {
+          if (
+            input.sessionIds.length === 0
+            || input.sessionIds.length > MAX_BATCH_IDS
+            || !input.sessionIds.every(id => typeof id === 'string')
+          ) {
+            return json({ ok: false, error: `sessionIds-must-be-1..${String(MAX_BATCH_IDS)}-strings` }, 400)
+          }
+          const results: SessionImpact[] = []
+          for (const rawId of input.sessionIds as readonly string[]) {
+            results.push(await previewSession(preview, rawId))
+          }
+          return json(previewPayload(results))
+        }
+        if (typeof input.sessionId !== 'string') {
+          return json({ ok: false, error: 'sessionId-or-sessionIds-required' }, 400)
+        }
+        return json(previewPayload([await previewSession(preview, input.sessionId)]))
+      } catch (error) {
+        logUnexpected(ctx, error, 'preview')
+        const message = publicErrorMessage(error)
+        return json({ ok: false, error: message }, message.includes('runtime-capability-missing') ? 501 : 500)
       }
     },
   })

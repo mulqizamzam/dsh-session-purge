@@ -1,7 +1,9 @@
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { BatchPurgeResult, PurgeResult } from '../purge-core.ts'
+import type { SessionImpact } from '../preview-core.ts'
 
 const DELETE_PATH = '/api/session-purge/delete'
+const PREVIEW_PATH = '/api/session-purge/preview'
 
 /** One listable session as the selection manager shows it. */
 export interface SessionRow {
@@ -47,6 +49,8 @@ export interface PurgeUiState {
   readonly busy: boolean
   readonly error: string | null
   readonly itemFailures: readonly ItemFailure[]
+  /** What the pending deletion would remove; null until the host answers. */
+  readonly impact: readonly SessionImpact[] | null
 }
 
 type Listener = () => void
@@ -62,6 +66,7 @@ export class SessionPurgeController {
     busy: false,
     error: null,
     itemFailures: [],
+    impact: null,
   }
   private readonly listeners = new Set<Listener>()
   private nextToken = 1
@@ -81,19 +86,22 @@ export class SessionPurgeController {
     // NEW dialog while that session's own purge is still running — two deletes
     // racing through one state slot. The request is ignored instead.
     if (this.state.busy) return
+    const token = this.nextToken++
     this.setState({
       ...this.state,
-      target: { sessionId, title, token: this.nextToken++ },
+      target: { sessionId, title, token },
       batch: null,
       busy: false,
       error: null,
       itemFailures: [],
+      impact: null,
     })
+    void this.loadImpact([sessionId], token)
   }
 
   close(): void {
     if (this.state.busy) return
-    this.setState({ ...this.state, target: null, batch: null, busy: false, error: null, itemFailures: [] })
+    this.setState({ ...this.state, target: null, batch: null, busy: false, error: null, itemFailures: [], impact: null })
   }
 
   openManager(rows: readonly SessionRow[]): void {
@@ -146,15 +154,43 @@ export class SessionPurgeController {
     if (this.state.busy) return
     const chosen = this.selectedRows()
     if (chosen.length === 0) return
+    const token = this.nextToken++
     this.setState({
       ...this.state,
       managerOpen: false,
       target: null,
-      batch: { items: chosen, token: this.nextToken++ },
+      batch: { items: chosen, token },
       busy: false,
       error: null,
       itemFailures: [],
+      impact: null,
     })
+    void this.loadImpact(chosen.map(item => item.sessionId), token)
+  }
+
+  /**
+   * Ask the host what the pending deletion would remove.
+   *
+   * The preview is advisory: it only adds numbers to the dialog, so a failed
+   * read leaves the delete path exactly as it was. An answer that arrives after
+   * its dialog closed is dropped instead of reviving a closed dialog.
+   */
+  private async loadImpact(ids: readonly SessionId[], token: number): Promise<void> {
+    try {
+      const response = await fetch(PREVIEW_PATH, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ sessionIds: ids }),
+      })
+      const raw = await response.text()
+      const payload = JSON.parse(raw) as { ok?: boolean; results?: SessionImpact[] }
+      if (!response.ok || payload.ok !== true || !Array.isArray(payload.results)) return
+      if (this.state.target?.token !== token && this.state.batch?.token !== token) return
+      this.setState({ ...this.state, impact: payload.results })
+    } catch {
+      /* an unreadable impact must never block the deletion */
+    }
   }
 
   async confirm(): Promise<void> {

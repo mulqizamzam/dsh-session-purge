@@ -2,11 +2,12 @@
 
 ## Overview
 
-A DSH plugin with two halves: a Node host half that registers one HTTP endpoint and
-one model-facing guidance tool, and a browser client half that adds a
-human-confirmed **Delete session** action to the session header and to the sidebar
-session menu. It is for people running a DSH profile who want permanent session
-deletion to be impossible without a human ticking a checkbox in the UI.
+A DSH plugin with two halves: a Node host half that registers two HTTP endpoints
+(one destructive, one read-only) and one model-facing guidance tool, and a browser
+client half that adds a human-confirmed **Delete session** action to the session
+header and to the sidebar session menu. It is for people running a DSH profile who
+want permanent session deletion to be impossible without a human ticking a checkbox
+in the UI.
 
 Every headline feature is traceable to a file:
 
@@ -15,10 +16,13 @@ Every headline feature is traceable to a file:
 | 🗑 button in the session header | `src/client/index.tsx`, slot `conversation.session.header.utilities` |
 | `Delete session` entry in the session "…" menu | `src/client/index.tsx`, slot `sidebar.workspaces.session.menu.item` |
 | Irreversible-action dialog with a checkbox | `src/client/index.tsx`, component `ConfirmOverlay` |
+| Impact panel in the dialog (size, age, blocked sessions) | `src/client/index.tsx`, component `ImpactPanel` |
 | `session_purge` guidance tool for the model | `src/index.ts` |
 | `POST /api/session-purge/delete` endpoint | `src/index.ts` |
+| `POST /api/session-purge/preview` endpoint (read-only) | `src/index.ts` |
 | Capability-detected bridge to host services | `src/runtime-adapter.ts` |
 | Ordered, fail-closed cleanup | `src/purge-core.ts`, covered by `test/purge-core.test.ts` |
+| Read-only impact report | `src/preview-core.ts`, covered by `test/preview.test.ts` |
 
 This is not turnkey on stock upstream DSH. The published persistence contract does
 not provide `sessionPersistence.delete()`, and this plugin fails closed when a
@@ -42,6 +46,57 @@ If cache cleanup fails after the log is gone, workspace cleanup is still attempt
 and the response reports partial failure. Only a canonical UUID is passed to host
 services; the on-disk `session-` naming form is normalized at the boundary
 (`normalizeSessionId`), so a second delete against a display-form id is never issued.
+
+## Impact preview (read-only)
+
+Before the operator commits, the dialog asks the host what a deletion would remove.
+That question travels to `POST /api/session-purge/preview`, a read-only route that
+shares the delete route's origin and content-type fences but calls no removal
+primitive — it never deletes, not even for a batch.
+
+Request body. No `confirm` is needed, because nothing destructive happens here:
+
+```json
+{ "sessionId": "<uuid>" }
+```
+
+```json
+{ "sessionIds": ["<uuid>", "<uuid>"] }
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "results": [
+    {
+      "id": "2de8b71d-bd3b-4f4d-8d1d-5dceac76f934",
+      "exists": true,
+      "createdAt": 1760000000000,
+      "ageDays": 5,
+      "sizeBytes": 4096,
+      "liveAgent": false,
+      "attached": false,
+      "deletable": true,
+      "blockedReason": ""
+    }
+  ],
+  "totalBytes": 4096
+}
+```
+
+- `createdAt` is epoch milliseconds and `ageDays` is derived from it;
+  `sizeBytes` is the physical artifact size the host's `sessionPersistence.stat()`
+  reports. A host that does not expose `stat()` answers HTTP 501 with
+  `runtime-capability-missing`, and the delete path is unaffected.
+- `blockedReason` is `''` when the deletion can proceed, `log-not-found` when the
+  session has no stored log, `session-live` when a live agent holds it and the host
+  exposes no disposal bridge, and `invalid-session-id` for a malformed id. A
+  malformed id is reported per item instead of failing the whole request: the
+  preview is a report, so one unusable id must not hide the others.
+- The panel is advisory. When the preview cannot be read, the dialog still
+  deletes — only the consent checkbox gates the destructive button.
 
 ## Compatibility notes (verified against DSH `0.2.0-rc.2`)
 
@@ -246,17 +301,19 @@ http://127.0.0.1:13080` → 401 (fence passed, auth failed), foreign `Origin` �
 
 ```text
 src/
-  index.ts              # host half: session_purge tool + POST endpoint, single and batch (start here)
+  index.ts              # host half: session_purge tool + delete and preview endpoints (start here)
   purge-core.ts         # ordered cleanup, pure and host-independent
+  preview-core.ts       # read-only impact report, pure and host-independent
   runtime-adapter.ts    # capability-detected bridge; every missing method fails closed
   client/
-    index.tsx           # slot injections, locale dictionaries (en, zh), confirm dialog, selection manager
-    controller.ts       # UI state: single + multi-select, batch POST, in-place list refresh
+    index.tsx           # slot injections, locale dictionaries (en, zh), confirm dialog, impact panel, selection manager
+    controller.ts       # UI state: single + multi-select, impact preview, batch POST, in-place list refresh
 test/
   purge-core.test.ts    # ordering, failure-path and batch tests (16 tests)
   controller.test.ts    # client state machine tests (15 tests)
   api-route.test.ts     # route, origin gate, capability, model-tool refusal and batch tests (36 tests)
-  client-ui.test.ts     # jsdom mount of the real components, real events (14 tests)
+  client-ui.test.ts     # jsdom mount of the real components, real events (17 tests)
+  preview.test.ts       # read-only preview route: impact, fences, and that it never deletes (14 tests)
 integration/
   README.md             # host capabilities required for real deletion
 cordis.patch.yml        # how the profile mounts this package (one insert row)
@@ -294,9 +351,9 @@ dsh plugin --profile <name> remove dsh-session-purge
 ## Testing
 
 Runner: vitest, invoked as `npm test`. There is no `vitest.config.*` file, so
-vitest's defaults pick up the four files under `test/`.
+vitest's defaults pick up the five files under `test/`.
 
-Four layers:
+Five layers:
 
 - `test/purge-core.test.ts` drives `purgeSession` and `purgeSessions` against a
   fake `SessionPurgeRuntime` and asserts ordering, failure paths, signal
@@ -320,16 +377,23 @@ Four layers:
   checkbox rows with the current session disabled, select-all/clear/delete via
   real clicks, the consent gate, the batch submit with its exact POST body,
   per-item failure rendering, and the retry of only the failed remainder.
+- `test/preview.test.ts` drives the read-only preview route through a real cordis
+  Context like the delete suite: the impact record (size, age, live agent, blocked
+  reason), the origin and content-type fences, the 501 when the host cannot report
+  stored metadata, and the proof that a preview of a deletable batch calls
+  `sessionPersistence.delete` zero times.
 
 What success looks like (observed):
 
 ```text
- ✓ test/purge-core.test.ts (16 tests) 19ms
- ✓ test/controller.test.ts (15 tests) 67ms
- ✓ test/api-route.test.ts (36 tests) 216ms
+ ✓ test/purge-core.test.ts (16 tests) 25ms
+ ✓ test/controller.test.ts (15 tests) 153ms
+ ✓ test/preview.test.ts (14 tests) 914ms
+ ✓ test/api-route.test.ts (36 tests) 1486ms
+ ✓ test/client-ui.test.ts (17 tests) 3163ms
 
- Test Files  3 passed (3)
-       Tests  67 passed (67)
+ Test Files  5 passed (5)
+      Tests  98 passed (98)
 ```
 
 Exit code 0 on pass (observed). A failing assertion is reported per test by vitest
@@ -423,10 +487,11 @@ Notes:
   checkbox plus the confirm button may call the cleanup core (`src/index.ts`).
 - **Endpoint guards:** an `origin` whose host differs from the request's `host`
   authority is rejected with 403, non-JSON body rejected with 415, `confirm` must
-  be the literal `true`, ids must be canonical UUIDs. Authentication and transport
-  trust are applied by the host's connection boundary before this handler runs;
-  verify both in your own host composition before exposing it to an untrusted
-  network.
+  be the literal `true`, ids must be canonical UUIDs. The read-only preview route
+  shares the origin and content-type fences but requires no `confirm`, because it
+  deletes nothing. Authentication and transport trust are applied by the host's
+  connection boundary before this handler runs; verify both in your own host
+  composition before exposing it to an untrusted network.
 - **The `origin` guard compares the Host authority, never `request.url`.** The host
   bridges `/api` requests through `packages/client/connection/src/http-bridge.ts`,
   which rebuilds every URL against the synthetic base `http://dsh.internal`, so a
@@ -457,6 +522,17 @@ HTTP 501 with `runtime-capability-missing` and touches nothing.
 **Can I ask the agent to delete a session for me?**
 No, by design. `confirm: true` from the model is data, not proof of consent.
 
+**What does the dialog show before I confirm?**
+What the deletion would remove: the stored size, how old the session is, and any
+session the host would refuse to delete right now (a live agent with no disposal
+bridge). The panel is informational — if the host cannot answer, the dialog still
+deletes, and only the consent checkbox gates the destructive button.
+
+**Does the preview delete anything?**
+No. `POST /api/session-purge/preview` reads stored-session metadata and calls no
+removal primitive. `test/preview.test.ts` asserts that a preview of a deletable
+batch leaves `sessionPersistence.delete` uncalled.
+
 **Where do the buttons come from?**
 Slot injections in `src/client/index.tsx`. They exist only where the host runs the
 `web` platform half of the client module system.
@@ -481,7 +557,7 @@ cannot prove compatibility, so check your runtime yourself with
 - [ ] You cloned this repository and `cd` into it
 - [ ] `npm install` completed against a registry that publishes `@deepseek-ai/*`
 - [ ] `npm run type-check` exited 0 with no output
-- [ ] `npm test` reported `7 passed (7)`
+- [ ] `npm test` reported `98 passed (98)`
 - [ ] `npm run build` wrote `lib/index.js` and `lib/client.js`
 - [ ] `dsh plugin --profile <name> add link:.` completed
 - [ ] `dsh --profile <name> --dump-config` shows the `session-purge` row

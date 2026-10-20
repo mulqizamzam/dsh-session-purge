@@ -2,6 +2,7 @@ import {
   SessionPurgeError,
   type SessionPurgeRuntime,
 } from './purge-core.ts'
+import type { SessionPreviewRuntime, StoredSessionSnapshot } from './preview-core.ts'
 
 /**
  * Structural view of the optional services available in compatible DSH forks.
@@ -241,6 +242,46 @@ export function createRuntimeAdapter(resolve: ServiceResolver): SessionPurgeRunt
         )
       }
       await method.call(workspaceRegistry, id)
+    },
+  }
+}
+
+/**
+ * Build the read-only half of the adapter: what a stored session holds, and
+ * whether the host could delete it right now.
+ *
+ * The capability rules mirror the purge adapter's, so the preview cannot
+ * promise something the delete would refuse: a live agent is only deletable
+ * when the host owns a disposal bridge (`sessionController.closeSession`), and
+ * the stored metadata comes from the host's own `stat()` primitive.
+ */
+export function createPreviewAdapter(resolve: ServiceResolver): SessionPreviewRuntime {
+  return {
+    async statSession(id) {
+      const persistence = resolve('sessionPersistence')
+      if (!persistence || typeof persistence.stat !== 'function') {
+        throw new SessionPurgeError(
+          'runtime-capability-missing',
+          'validate',
+          'The persistence service cannot report stored-session metadata; the impact preview is unavailable.',
+        )
+      }
+      const stat = persistence.stat as (id: string) => Promise<StoredSessionSnapshot | undefined>
+      return await stat.call(persistence, id)
+    },
+    hasLiveAgent(id) {
+      const agents = resolve('agents')
+      if (!agents || typeof agents.get !== 'function') return false
+      return Boolean(agents.get(id))
+    },
+    isAttached(id) {
+      const sessions = resolve('sessions')
+      if (!sessions || typeof sessions.get !== 'function') return false
+      return Boolean(sessions.get(id))
+    },
+    canDisposeLiveSession() {
+      const controller = resolve('sessionController') as { closeSession?: unknown } | undefined
+      return typeof controller?.closeSession === 'function'
     },
   }
 }

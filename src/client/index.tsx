@@ -11,6 +11,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import { MenuItemButton } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, LocaleDictOf, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { SessionPurgeController, type SessionRow } from './controller.ts'
+import type { SessionImpact } from '../preview-core.ts'
 
 const NS = 'session-purge'
 type LocaleKey =
@@ -18,6 +19,7 @@ type LocaleKey =
   | 'selectMode' | 'managerTitle' | 'managerEmpty' | 'managerHint' | 'selectAll' | 'clearSelection'
   | 'deleteSelected' | 'confirmBatch' | 'batchTitle' | 'batchMore'
   | 'running' | 'currentSession' | 'currentSessionNote' | 'retryHint'
+  | 'impactTitle' | 'impactAge' | 'impactTotal' | 'impactBlocked'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -49,6 +51,10 @@ const en: LocaleDictOf<typeof NS> = {
   currentSession: 'current session',
   currentSessionNote: 'The session you are viewing cannot be included in a batch delete; delete it from its own Delete button instead.',
   retryHint: 'Retry sends only the sessions that failed.',
+  impactTitle: 'What will be removed',
+  impactAge: '{count} days old',
+  impactTotal: '{count} sessions · {size} in total',
+  impactBlocked: 'Cannot be removed now: {reason}',
 }
 const zh: LocaleDictOf<typeof NS> = {
   delete: '删除会话',
@@ -74,6 +80,10 @@ const zh: LocaleDictOf<typeof NS> = {
   currentSession: '当前会话',
   currentSessionNote: '当前所在的会话不能包含在批量删除中；请使用其自身的删除按钮。',
   retryHint: '重试只会重新提交失败的会话。',
+  impactTitle: '将被删除的内容',
+  impactAge: '已创建 {count} 天',
+  impactTotal: '{count} 个会话 · 共 {size}',
+  impactBlocked: '当前无法删除：{reason}',
 }
 
 /**
@@ -284,6 +294,44 @@ function SelectionManager({ controller, t }: OverlayProps) {
   )
 }
 
+/** Stored size in a form an operator can read at a glance. */
+function formatBytes(bytes: number | null): string {
+  if (bytes === null) return '—'
+  if (bytes < 1024) return `${String(bytes)} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/**
+ * What the pending deletion would remove: the stored size, how old it is, and
+ * any session the host would refuse to delete right now. Purely informative —
+ * the destructive button never depends on it.
+ */
+function ImpactPanel({ impact, t }: { impact: readonly SessionImpact[]; t: OverlayProps['t'] }) {
+  if (impact.length === 0) return null
+  const totalBytes = impact.reduce((sum, item) => sum + (item.sizeBytes ?? 0), 0)
+  const ages = impact.map(item => item.ageDays).filter((age): age is number => age !== null)
+  const oldest = ages.length > 0 ? Math.round(Math.max(...ages)) : null
+  const blocked = impact.filter(item => item.blockedReason !== '')
+  const headline = impact.length === 1
+    ? formatBytes(impact[0].sizeBytes)
+    : t('impactTotal', { count: impact.length, size: formatBytes(totalBytes) })
+  return (
+    <div style={{ margin: '0 0 14px', padding: '10px 12px', borderRadius: 10, background: 'var(--dsh-surface, rgba(0,0,0,0.05))' }}>
+      <div style={{ fontSize: 12, opacity: 0.7 }}>{t('impactTitle')}</div>
+      <div style={{ fontSize: 13, marginTop: 2 }}>
+        {headline}
+        {oldest !== null && ` · ${t('impactAge', { count: oldest })}`}
+      </div>
+      {blocked.map(item => (
+        <div key={item.id} style={{ fontSize: 12, color: 'var(--dsh-danger, #c33)' }}>
+          {t('impactBlocked', { reason: item.blockedReason })}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function ConfirmOverlay({ controller, t }: OverlayProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
   const [acknowledgedToken, setAcknowledgedToken] = useState<number | null>(null)
@@ -326,6 +374,7 @@ function ConfirmOverlay({ controller, t }: OverlayProps) {
               </ul>
             </>
           )}
+        {state.impact !== null && state.impact.length > 0 && <ImpactPanel impact={state.impact} t={t} />}
         <p>{t('body')}</p>
         <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '16px 0' }}>
           <input type="checkbox" checked={acknowledged} disabled={state.busy} onChange={event => setAcknowledgedToken(event.target.checked ? token : null)} />
