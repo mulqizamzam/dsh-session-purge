@@ -209,10 +209,10 @@ function sumKnown(candidates: readonly PolicyCandidate[]): number | null {
  * move the cut.
  *
  * The byte budget is positional: the newest sessions are kept while their
- * known sizes fit under the cap, and everything past that point is removed. A
- * session whose size the host did not report is kept — its size cannot be
- * proven to break the budget, and this tool only removes what it can show is
- * over the limit.
+ * known sizes fit under the cap, and every session past that point whose size
+ * is known is removed. A session whose size the host did not report is kept
+ * wherever it sits — its size cannot be proven to break the budget, and this
+ * tool only removes what it can show is over the limit.
  * @param candidates - every stored session.
  * @param policy - the operator's limits.
  * @param now - the reference time, epoch milliseconds.
@@ -247,11 +247,16 @@ export function selectByPolicy(
     let used = 0
     let overBudget = false
     for (const candidate of ordered) {
+      // An unknown size is checked before the cut, not after it: the host did
+      // not report a size for this session, so nothing about it can be shown to
+      // break the budget. Skipping it here also keeps it out of the selection
+      // when it sits past the cut — the positional cut may only remove
+      // sessions whose size is known.
+      if (candidate.sizeBytes === null) continue
       if (overBudget) {
         flagged.add(candidate.id)
         continue
       }
-      if (candidate.sizeBytes === null) continue
       if (used + candidate.sizeBytes > policy.maxTotalBytes) {
         overBudget = true
         flagged.add(candidate.id)
@@ -271,8 +276,15 @@ export function selectByPolicy(
   }
 }
 
-/** Normalize the ids the caller asked to leave alone; an unusable one cannot match anything. */
-function excludedSet(rawIds: readonly string[]): Set<string> {
+/**
+ * Normalize the ids a caller asked to leave alone.
+ *
+ * The ids are normalized the same way the stored ids are, so an exclusion
+ * matches the session whether the caller wrote `session-<uuid>` or `<uuid>`.
+ * An id that cannot name a stored session protects nothing and is dropped.
+ * @param rawIds - the ids as the caller wrote them.
+ */
+export function normalizeExcludedIds(rawIds: readonly string[]): Set<string> {
   const excluded = new Set<string>()
   for (const raw of rawIds) {
     try {
@@ -297,7 +309,7 @@ export async function previewPolicy(
   now: number = Date.now(),
   excludeIds: readonly string[] = [],
 ): Promise<PolicyPreviewReport> {
-  const excluded = excludedSet(excludeIds)
+  const excluded = normalizeExcludedIds(excludeIds)
   const snapshots = await runtime.listSessions()
   const candidates = candidatesFrom(snapshots)
   const selection = selectByPolicy(candidates, policy, now, excluded)

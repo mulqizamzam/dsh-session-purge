@@ -446,7 +446,7 @@ function PolicyOverlay({ controller, t }: OverlayProps) {
   if (!state.policyOpen) return null
   const preview = state.policyPreview
   const canApply = preview !== null
-    && preview.selectedIds.length > 0
+    && preview.selected.length > 0
     && state.policyAcknowledged
     && !state.policyBusy
   const limitField = (
@@ -508,6 +508,37 @@ function PolicyOverlay({ controller, t }: OverlayProps) {
                       size: formatBytes(preview.bytesToFree),
                     })}
                   </div>
+                  {/* The sessions themselves, not only their number: the
+                      operator consents to these ids, so it must be able to see
+                      which ones they are. */}
+                  <ul style={{ listStyle: 'none', margin: '8px 0 0', padding: 0, maxHeight: 140, overflowY: 'auto' }}>
+                    {preview.selected.slice(0, 8).map(row => {
+                      const reasonKey = REASON_KEYS[row.blockedReason]
+                      return (
+                        <li key={row.id} style={{ display: 'flex', gap: 8, justifyContent: 'space-between', fontSize: 12, padding: '2px 0' }}>
+                          <code style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {row.id}
+                          </code>
+                          <span style={{ opacity: 0.7, flexShrink: 0 }}>
+                            {row.ageDays === null ? '—' : t('impactAge', { count: row.ageDays })}
+                            {' · '}
+                            {formatBytes(row.sizeBytes)}
+                            {reasonKey !== undefined && (
+                              <span style={{ color: 'var(--dsh-danger, #c33)' }}>
+                                {' · '}
+                                {t('impactBlocked', { reason: t(reasonKey) })}
+                              </span>
+                            )}
+                          </span>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                  {preview.selected.length > 8 && (
+                    <div style={{ fontSize: 12, opacity: 0.7 }}>
+                      {t('batchMore', { count: preview.selected.length - 8 })}
+                    </div>
+                  )}
                   {preview.truncated && (
                     <div style={{ fontSize: 12, opacity: 0.7 }}>
                       {t('policyTruncated', { count: preview.totalSelected, shown: preview.selectedCount })}

@@ -75,6 +75,8 @@ async function install(services?: Record<string, object>): Promise<Harness> {
 interface HostOptions {
   readonly stored?: Record<string, StoredSession>
   readonly live?: readonly string[]
+  /** Sessions the host still holds open, so flush and detach are reached. */
+  readonly attached?: readonly string[]
   readonly withoutList?: boolean
   readonly withoutStat?: boolean
 }
@@ -93,6 +95,7 @@ function policyCapableHost(options: HostOptions = {}): { services: Record<string
   // the absence afterwards.
   const stored: Record<string, StoredSession> = { ...(options.stored ?? {}) }
   const live = new Set(options.live ?? [])
+  const attached = new Set(options.attached ?? [])
   const persistence: Record<string, unknown> = {
     delete: async (id: string) => {
       record('sessionPersistence.delete', id)
@@ -122,10 +125,17 @@ function policyCapableHost(options: HostOptions = {}): { services: Record<string
     // A live agent leaves the registry when it is stopped, exactly as the
     // purge's postcondition expects.
     agents: {
-      get: (id: string) => (live.has(id) ? { stop: async () => { live.delete(id) } } : undefined),
+      get: (id: string) => (live.has(id)
+        ? { stop: async () => { record('agents.stop', id); live.delete(id) } }
+        : undefined),
       list: () => [],
     },
-    sessions: { get: () => undefined, list: () => [], flush: async () => {} },
+    sessions: {
+      get: (id: string) => (attached.has(id) ? { id } : undefined),
+      list: () => [],
+      flush: async (session: unknown) => { record('sessions.flush', String((session as { id?: string })?.id ?? '')) },
+      detach: async (id: string) => { record('sessions.detach', id); attached.delete(id) },
+    },
     sessionPersistence: persistence,
     sessionProjectionCache: { purge: async (id: string) => { record('sessionProjectionCache.purge', id); return true } },
     workspaceRegistry: { releaseSession: async (id: string) => { record('workspaceRegistry.releaseSession', id) } },
@@ -215,7 +225,14 @@ describe('POST /api/session-purge/policy/preview', () => {
   })
 
   it('touches no mutating primitive', async () => {
-    const { services, mutations } = policyCapableHost({ stored: THREE_SESSIONS })
+    // The host holds one session open with a live agent, so a preview that
+    // reached into the cleanup pipeline would record a stop, a flush and a
+    // detach. Every primitive is recorded, not only the delete.
+    const { services, mutations } = policyCapableHost({
+      stored: THREE_SESSIONS,
+      live: [ID_OLD],
+      attached: [ID_OLD],
+    })
     const { routes } = await opened(services)
     const { status } = await call(routes[2], { policy: { maxAgeDays: 1 } }, SAME_ORIGIN)
     expect(status).toBe(200)
@@ -291,7 +308,7 @@ describe('POST /api/session-purge/policy/apply', () => {
     expect(mutations['sessionPersistence.delete']).toEqual(selectedIds)
   })
 
-  it('skips a session a live agent holds and reports why', async () => {
+  it('removes a session whose live agent the host is able to stop', async () => {
     const { services, mutations } = policyCapableHost({ stored: THREE_SESSIONS, live: [ID_OLD] })
     const { routes } = await opened(services)
     const { status, payload } = await call(routes[3], { sessionIds: [ID_OLD], confirm: true }, SAME_ORIGIN)
@@ -338,11 +355,34 @@ describe('POST /api/session-purge/policy/apply', () => {
     expect(mutations['sessionPersistence.delete']).toEqual(['11111111-2222-4333-8444-555555555555'])
   })
 
-  it('refuses an empty or oversized id list', async () => {
+  it('refuses an empty id list', async () => {
     const { routes } = await opened(policyCapableHost({ stored: THREE_SESSIONS }).services)
     const empty = await call(routes[3], { sessionIds: [], confirm: true }, SAME_ORIGIN)
     expect(empty.status).toBe(400)
     expect(String(empty.payload.error)).toContain('sessionIds-must-be-1..500-strings')
+  })
+
+  it('refuses an id list longer than one run may remove', async () => {
+    const { routes } = await opened(policyCapableHost({ stored: THREE_SESSIONS }).services)
+    const tooMany = Array.from({ length: 501 }, (_unused, index) => `${String(index).padStart(8, '0')}-0000-4000-8000-000000000000`)
+    const oversized = await call(routes[3], { sessionIds: tooMany, confirm: true }, SAME_ORIGIN)
+    expect(oversized.status).toBe(400)
+    expect(String(oversized.payload.error)).toContain('sessionIds-must-be-1..500-strings')
+  })
+
+  it('leaves an excluded session alone even when the request names it', async () => {
+    const { services, mutations } = policyCapableHost({ stored: THREE_SESSIONS })
+    const { routes } = await opened(services)
+    const { status, payload } = await call(routes[3], {
+      sessionIds: [ID_OLD, ID_MID],
+      excludeSessionIds: [ID_OLD],
+      confirm: true,
+    }, SAME_ORIGIN)
+    expect(status).toBe(200)
+    // The exclusion is honoured on the explicit-ids path too.
+    expect(mutations['sessionPersistence.delete']).toEqual([ID_MID])
+    expect(payload.excluded).toBe(1)
+    expect(payload.total).toBe(1)
   })
 
   it('reports a policy that selects nothing as a successful no-op', async () => {
@@ -356,6 +396,20 @@ describe('POST /api/session-purge/policy/apply', () => {
     expect(payload.succeeded).toBe(0)
     expect(payload.blocked).toBe(0)
     expect(mutations).toEqual({})
+  })
+
+  it('counts the bytes of a session whose log is gone even when its cleanup failed', async () => {
+    const { services } = policyCapableHost({ stored: THREE_SESSIONS })
+    // The log is deleted and verified; the derived cleanup then fails.
+    services.sessionProjectionCache = { purge: async () => { throw new Error('the cache is down') } }
+    const { routes } = await opened(services)
+    const { status, payload } = await call(routes[3], { sessionIds: [ID_OLD], confirm: true }, SAME_ORIGIN)
+    expect(status).toBe(500)
+    expect(payload.failed).toBe(1)
+    expect(payload.ok).toBe(false)
+    // The log is what held the bytes, and it is gone: the space was freed even
+    // though the cleanup after it failed.
+    expect(payload.bytesFreed).toBe(300)
   })
 
   it('answers 501 when the host cannot report stored-session metadata', async () => {

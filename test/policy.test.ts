@@ -62,6 +62,12 @@ describe('validatePolicy', () => {
 
   it('accepts a byte budget of zero, which removes every known-sized session', () => {
     expect(validatePolicy({ maxTotalBytes: 0 })).toEqual({ maxTotalBytes: 0 })
+    const selection = selectByPolicy(
+      [candidate(ID_OLD, 31, 100), candidate(ID_NEW, 1, 200)],
+      { maxTotalBytes: 0 },
+      NOW,
+    )
+    expect(selection.selected.map(item => item.id)).toEqual([ID_OLD, ID_NEW])
   })
 })
 
@@ -153,6 +159,19 @@ describe('selectByPolicy', () => {
     expect(selection.bytesToFree).toBeNull()
   })
 
+  it('keeps a session whose size the host did not report even past the byte cut', () => {
+    // The cut falls at C: A fits the cap, C does not, and D sits behind the cut
+    // with a size the host never reported. The positional cut may only remove
+    // sessions whose size is known.
+    const selection = selectByPolicy(
+      [candidate(ID_NEW, 1, 100), candidate(ID_OLD, 31, 200), { id: ID_MID, createdAt: daysAgo(20), sizeBytes: null }],
+      { maxTotalBytes: 100 },
+      NOW,
+    )
+    expect(selection.selected.map(item => item.id)).toEqual([ID_OLD])
+    expect(selection.kept.map(item => item.id)).toContain(ID_MID)
+  })
+
   it('never removes a session without a known creation time because of its age', () => {
     const selection = selectByPolicy(
       [{ id: ID_OLD, createdAt: null, sizeBytes: 10 }],
@@ -210,6 +229,7 @@ function fakeRuntime(options: {
   live?: readonly string[]
   liveAgentState?: LiveAgentState
   attached?: readonly string[]
+  canStopAndDrain?: (id: string) => boolean
 }): FakeRuntime {
   const listed: string[] = []
   const live = new Set(options.live ?? [])
@@ -227,7 +247,7 @@ function fakeRuntime(options: {
       if (options.liveAgentState) return options.liveAgentState
       return live.has(id) ? 'live' : 'idle'
     },
-    canStopAndDrain: () => true,
+    canStopAndDrain: options.canStopAndDrain ?? (() => true),
     isAttached: (id: string) => attached.has(id),
   }
 }
@@ -268,11 +288,21 @@ describe('previewPolicy', () => {
     expect(report.excludedIds).toEqual([ID_OLD])
   })
 
-  it('reports a session a live agent holds as blocked, not as removable', async () => {
+  it('reports a session a live agent holds as blocked when the host cannot stop it', async () => {
+    const runtime = fakeRuntime({ snapshots, live: [ID_OLD] })
+    runtime.canStopAndDrain = () => false
+    const report = await previewPolicy(runtime, { maxAgeDays: 30 }, NOW)
+    expect(report.selected[0]?.liveAgent).toBe('live')
+    expect(report.selected[0]?.blockedReason).toBe('session-live')
+    expect(report.selected[0]?.deletable).toBe(false)
+  })
+
+  it('reports a session a live agent holds as removable when the host can stop it', async () => {
     const runtime = fakeRuntime({ snapshots, live: [ID_OLD] })
     const report = await previewPolicy(runtime, { maxAgeDays: 30 }, NOW)
     expect(report.selected[0]?.liveAgent).toBe('live')
     expect(report.selected[0]?.blockedReason).toBe('')
+    expect(report.selected[0]?.deletable).toBe(true)
   })
 
   it('reports a host without an agent registry as blocking everything', async () => {

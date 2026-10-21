@@ -1,9 +1,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { purgeSession, purgeSessions, type PurgeResult } from './purge-core.ts'
+import { purgeSession, purgeSessions, normalizeSessionId, type PurgeResult } from './purge-core.ts'
 import { previewSessions } from './preview-core.ts'
 import {
   MAX_POLICY_SESSIONS,
+  normalizeExcludedIds,
   planPolicyApply,
   previewPolicy,
   validatePolicy,
@@ -461,6 +462,14 @@ export function apply(ctx: Context): void {
         return json({ ok: false, error: 'confirm-true-required' }, 400)
       }
       let ids: readonly string[]
+      // How many sessions the caller asked for, before the exclusions were
+      // applied. The difference is what the run left alone on request.
+      let requestedCount = 0
+      // The exclusions are the caller's "leave this alone" list. They are
+      // honoured on BOTH paths: the policy path hands them to the selection,
+      // and the explicit-ids path filters them out here, so a request that
+      // names an excluded session still cannot remove it.
+      const excluded = normalizeExcludedIds(stringIds(input.excludeSessionIds))
       try {
         if (Array.isArray(input.sessionIds)) {
           if (
@@ -470,11 +479,14 @@ export function apply(ctx: Context): void {
           ) {
             return json({ ok: false, error: `sessionIds-must-be-1..${String(MAX_POLICY_SESSIONS)}-strings` }, 400)
           }
-          ids = input.sessionIds as readonly string[]
+          const requested = input.sessionIds as readonly string[]
+          requestedCount = requested.length
+          ids = requested.filter(id => !isExcluded(id, excluded))
         } else {
           const limits = validatePolicy(input.policy)
           const report = await previewPolicy(policy, limits, Date.now(), stringIds(input.excludeSessionIds))
           ids = report.selected.map(item => item.id)
+          requestedCount = ids.length
         }
       } catch (error) {
         logUnexpected(ctx, error, 'policy-apply-select')
@@ -497,7 +509,9 @@ export function apply(ctx: Context): void {
         )
         const sizes = new Map(plan.impacts.map(item => [item.id, item.sizeBytes]))
         const freed = batch.results
-          .filter(result => result.ok)
+          // The log is what holds the bytes. A session whose log is gone but
+          // whose cache cleanup failed did free its space, so it counts.
+          .filter(result => result.log)
           .map(result => sizes.get(result.id) ?? null)
         const known = freed.filter((size): size is number => size !== null)
         const response = {
@@ -510,6 +524,8 @@ export function apply(ctx: Context): void {
           succeeded: batch.succeeded,
           failed: batch.failed,
           blocked: plan.blocked.length,
+          // How many of the requested sessions were left alone on request.
+          excluded: Math.max(0, requestedCount - ids.length),
           bytesFreed: known.length === 0 ? null : known.reduce((sum, size) => sum + size, 0),
           results: batch.results,
           blockedResults: plan.blocked.map(item => ({ id: item.id, reason: item.blockedReason })),
@@ -528,6 +544,24 @@ export function apply(ctx: Context): void {
 function stringIds(value: unknown): readonly string[] {
   if (!Array.isArray(value)) return []
   return value.filter((id): id is string => typeof id === 'string')
+}
+
+/**
+ * True when the caller asked for this id to be left alone.
+ *
+ * The comparison happens in the normalized form, so an exclusion matches the
+ * session whether the caller wrote `session-<uuid>` or `<uuid>`.
+ * @param rawId - the id as the caller wrote it.
+ * @param excluded - the normalized exclusion list.
+ */
+function isExcluded(rawId: string, excluded: ReadonlySet<string>): boolean {
+  if (excluded.size === 0) return false
+  try {
+    return excluded.has(normalizeSessionId(rawId))
+  } catch {
+    // An id that cannot name a stored session cannot be removed either.
+    return false
+  }
 }
 
 /**

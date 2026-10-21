@@ -47,6 +47,15 @@ export interface PolicyLimits {
   readonly maxTotalBytes: string
 }
 
+/** One session the policy would remove. */
+export interface PolicySessionRow {
+  readonly id: string
+  readonly ageDays: number | null
+  readonly sizeBytes: number | null
+  /** '' when nothing stands in the way of removing it. */
+  readonly blockedReason: string
+}
+
 /** What the host said a policy would remove. */
 export interface PolicyPreviewSummary {
   readonly selectedCount: number
@@ -54,7 +63,7 @@ export interface PolicyPreviewSummary {
   readonly totalSelected: number
   readonly totalSessions: number
   readonly bytesToFree: number | null
-  readonly selectedIds: readonly string[]
+  readonly selected: readonly PolicySessionRow[]
   readonly blocked: readonly { readonly id: string; readonly reason: string }[]
   readonly truncated: boolean
 }
@@ -107,7 +116,7 @@ interface PolicyPreviewPayload {
   totalSelected?: number
   bytesToFree?: number | null
   truncated?: boolean
-  selected?: { id?: string; blockedReason?: string }[]
+  selected?: { id?: string; ageDays?: number; sizeBytes?: number | null; blockedReason?: string }[]
 }
 
 /** The host's answer to a policy run. */
@@ -125,16 +134,27 @@ interface PolicyApplyPayload {
  * One typed limit.
  *
  * An empty field is an unset limit; anything that is not a number is refused
- * here, where the operator can still see what they typed.
+ * here, where the operator can still see what they typed. The minimums are the
+ * host's own: a zero-day limit and a zero-session limit mean "remove
+ * everything", which the host refuses, and a zero-megabyte budget would do
+ * exactly that — so the client refuses it before the request is sent.
  * @param raw - the field's text.
  * @param name - how the field is called in the operator's language.
+ * @param minimum - the smallest value the host accepts.
+ * @param integer - whether the host insists on a whole number.
  */
-function parseLimit(raw: string, name: string): number | undefined {
+function parseLimit(raw: string, name: string, minimum: number, integer: boolean): number | undefined {
   const trimmed = raw.trim()
   if (trimmed.length === 0) return undefined
   const value = Number(trimmed)
-  if (!Number.isFinite(value) || value < 0) {
+  if (!Number.isFinite(value)) {
     throw new Error(`${name} must be a number.`)
+  }
+  if (integer && !Number.isInteger(value)) {
+    throw new Error(`${name} must be a whole number.`)
+  }
+  if (value < minimum) {
+    throw new Error(`${name} must be at least ${minimum}.`)
   }
   return value
 }
@@ -215,7 +235,16 @@ export class SessionPurgeController {
 
   setCurrentSession(sessionId: SessionId | null): void {
     if (this.state.currentSessionId === sessionId) return
-    this.setState({ ...this.state, currentSessionId: sessionId })
+    // Switching the conversation changes the one session that must never be
+    // removed, so the selection made against the old one goes with it — and
+    // the consent that was given for that selection goes too.
+    this.setState({
+      ...this.state,
+      currentSessionId: sessionId,
+      policyPreview: null,
+      policyResult: null,
+      policyAcknowledged: false,
+    })
   }
 
   toggle(sessionId: SessionId): void {
@@ -354,12 +383,21 @@ export class SessionPurgeController {
       this.setState({
         ...this.state,
         policyBusy: false,
+        // A new answer is a new selection, so the consent given for the old
+        // one does not carry over: the operator must look at what this answer
+        // names before it can be applied.
+        policyAcknowledged: false,
         policyPreview: {
           selectedCount: typeof payload.selectedCount === 'number' ? payload.selectedCount : selected.length,
           totalSelected: typeof payload.totalSelected === 'number' ? payload.totalSelected : selected.length,
           totalSessions: typeof payload.totalSessions === 'number' ? payload.totalSessions : 0,
           bytesToFree: typeof payload.bytesToFree === 'number' ? payload.bytesToFree : null,
-          selectedIds: selected.map(item => item.id).filter((id): id is string => typeof id === 'string'),
+          selected: selected.map(item => ({
+            id: typeof item.id === 'string' ? item.id : '',
+            ageDays: typeof item.ageDays === 'number' ? item.ageDays : null,
+            sizeBytes: typeof item.sizeBytes === 'number' ? item.sizeBytes : null,
+            blockedReason: typeof item.blockedReason === 'string' ? item.blockedReason : '',
+          })).filter(item => item.id.length > 0),
           blocked: selected
             .filter(item => typeof item.blockedReason === 'string' && item.blockedReason.length > 0)
             .map(item => ({ id: item.id ?? '', reason: item.blockedReason ?? '' })),
@@ -386,14 +424,22 @@ export class SessionPurgeController {
   async applyPolicy(): Promise<void> {
     if (this.state.policyBusy) return
     const preview = this.state.policyPreview
-    if (preview === null || preview.selectedIds.length === 0) return
+    if (preview === null || preview.selected.length === 0) return
+    const sessionIds = preview.selected.map(row => row.id)
     this.setState({ ...this.state, policyBusy: true, policyError: null })
     try {
       const response = await fetch(POLICY_APPLY_PATH, {
         method: 'POST',
         headers: { 'content-type': 'application/json', accept: 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ sessionIds: preview.selectedIds, confirm: true }),
+        body: JSON.stringify({
+          sessionIds,
+          confirm: true,
+          // The session the operator is viewing goes with the request, so the
+          // host leaves it alone even if the selection was made before the
+          // operator switched conversations.
+          excludeSessionIds: this.state.currentSessionId === null ? [] : [this.state.currentSessionId],
+        }),
       })
       const raw = await response.text()
       let payload: PolicyApplyPayload
@@ -440,11 +486,11 @@ export class SessionPurgeController {
    */
   private policyLimitsToRequest(): Record<string, number> {
     const policy: Record<string, number> = {}
-    const age = parseLimit(this.state.policyLimits.maxAgeDays, 'The age limit')
+    const age = parseLimit(this.state.policyLimits.maxAgeDays, 'The age limit', 1, false)
     if (age !== undefined) policy.maxAgeDays = age
-    const count = parseLimit(this.state.policyLimits.maxCount, 'The session count limit')
+    const count = parseLimit(this.state.policyLimits.maxCount, 'The session count limit', 1, true)
     if (count !== undefined) policy.maxCount = count
-    const megabytes = parseLimit(this.state.policyLimits.maxTotalBytes, 'The size limit')
+    const megabytes = parseLimit(this.state.policyLimits.maxTotalBytes, 'The size limit', 1, false)
     if (megabytes !== undefined) policy.maxTotalBytes = Math.round(megabytes * BYTES_PER_MEGABYTE)
     if (Object.keys(policy).length === 0) {
       throw new Error('Set at least one limit before previewing the policy.')

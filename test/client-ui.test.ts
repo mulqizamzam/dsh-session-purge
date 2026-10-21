@@ -581,9 +581,73 @@ describe('the retention policy overlay', () => {
     await flush()
     const call = fetchMock.mock.calls.find(candidate => String(candidate[0]).includes('/policy/apply'))
     const body = JSON.parse(String((call?.[1] as RequestInit | undefined)?.body ?? '{}'))
-    expect(body).toEqual({ sessionIds: [ID_A, ID_B], confirm: true })
+    expect(body).toEqual({ sessionIds: [ID_A, ID_B], confirm: true, excludeSessionIds: [] })
     expect(harness.refreshList).toHaveBeenCalledTimes(1)
     expect(container.textContent).toContain('2 removed')
+  })
+
+  it('takes the consent back when a new preview answers a different selection', async () => {
+    const harness = freshClient()
+    let call = 0
+    const fetchMock = vi.fn(async (url: unknown) => {
+      if (String(url).includes('/policy/preview')) {
+        call += 1
+        const ids = call === 1 ? [ID_A] : [ID_A, ID_B]
+        return new Response(JSON.stringify({
+          ok: true,
+          totalSessions: 12,
+          selectedCount: ids.length,
+          totalSelected: ids.length,
+          keptCount: 12 - ids.length,
+          bytesToFree: 1024 * ids.length,
+          truncated: false,
+          selected: ids.map(id => ({
+            id,
+            exists: true,
+            createdAt: Date.now(),
+            ageDays: 40,
+            sizeBytes: 1024,
+            liveAgent: 'idle',
+            attached: false,
+            deletable: true,
+            blockedReason: '',
+          })),
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ok: true, total: 0, succeeded: 0, failed: 0, blocked: 0, bytesFreed: null, results: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    act(() => { checkboxInputs(container)[0].click() })
+    expect(applyButton(container).disabled).toBe(false)
+    // The second answer names one session more. The consent was given for the
+    // first answer, so it cannot carry over to a selection the operator never
+    // saw.
+    clickButton(container, 'Preview policy')
+    await flush()
+    expect(applyButton(container).disabled).toBe(true)
+  })
+
+  it('lists the sessions the policy would remove', async () => {
+    const harness = freshClient()
+    vi.stubGlobal('fetch', policyFetch())
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    // The operator consents to these ids, so the ids are on screen.
+    expect(container.textContent).toContain(ID_A)
+    expect(container.textContent).toContain(ID_B)
+    expect(container.textContent).toContain('40 days old')
+    expect(container.textContent).toContain('1.0 KB')
   })
 
   it('drops the preview when a limit changes, so the run cannot act on a stale selection', async () => {

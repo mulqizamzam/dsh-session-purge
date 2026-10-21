@@ -176,10 +176,12 @@ It is read-only: it calls no removal primitive, and it needs no `confirm`.
 - The age is the same rounded age the impact panel shows, so a session that
   reads as `30.0` days old is inside a 30-day limit.
 - The byte budget is **positional**: the newest sessions are kept while their
-  known sizes fit under the cap, and everything past that point is selected. A
-  session whose size the host did not report is kept — its size cannot be shown
-  to break the budget, and this tool only removes what it can show is over the
-  limit.
+  known sizes fit under the cap, and every session past that point whose size
+  is known is selected. A session whose size the host did not report is kept
+  **wherever it sits** — its size cannot be shown to break the budget, and this
+  tool only removes what it can show is over the limit. (The host's contract
+  makes `sizeBytes` optional, and the JSONL backend reports none for a session
+  that was created but not yet materialized.)
 - The budgets are evaluated over *all* stored sessions, including the excluded
   ones: an excluded session still occupies a count slot and still holds bytes.
   Excluding it may only keep it, never move the cut.
@@ -214,11 +216,19 @@ a session that became live in between is reported instead of deleted.
   "succeeded": 11,
   "failed": 0,
   "blocked": 1,
+  "excluded": 0,
   "bytesFreed": 4500000,
   "results": [ { "ok": true, "id": "<uuid>", "log": true, "cache": true, "ledger": true, "stage": "complete", "error": "" } ],
   "blockedResults": [ { "id": "<uuid>", "reason": "session-live" } ]
 }
 ```
+
+- `excludeSessionIds` is honoured on **both** paths: the policy path hands it to
+  the selection, and the explicit-ids path filters it out, so a request that
+  names an excluded session still cannot remove it. `excluded` reports how many
+  were left alone on request.
+- `bytesFreed` counts the sessions whose **log** is gone, so a session whose
+  cleanup failed after its log was deleted still counts: its space is freed.
 
 - `blocked` counts the sessions something stood in the way of (a live agent the
   host can neither dispose nor stop). They are not removed and not counted as
@@ -228,14 +238,25 @@ a session that became live in between is reported instead of deleted.
   all, `500` for a genuine per-item failure, `200` for a clean run.
 - The client requires an explicit consent checkbox, and the button stays
   disabled until the preview exists — and typing a new limit drops the preview,
-  so a run can never act on a selection the operator never saw.
+  so a run can never act on a selection the operator never saw. A **new preview
+  also takes the consent back**, because it is a new selection.
+- The client enforces the host's own minimums before sending: at least 1 day,
+  at least 1 session, at least 1 MB. A zero budget would select every
+  known-sized session, which the host accepts for API callers but which is not
+  something to type by accident.
 
 ### The retention surface in the client
 
 The sidebar foot carries a second entry next to the manual selection button:
 🧹 **Retention**. It opens the policy surface with the three limits, a
-**Preview policy** button and an **Apply policy** button. The session the
-operator is currently viewing is excluded from every policy request.
+**Preview policy** button and an **Apply policy** button. The preview lists the
+sessions it would remove — id, age and size — so the operator consents to
+*these* sessions, not to a number.
+
+The session the operator is currently viewing is excluded from every policy
+request: it is left out of the preview, it travels with the run as
+`excludeSessionIds`, and switching conversation drops the preview and its
+consent.
 
 ## Compatibility notes (verified against DSH `0.2.0-rc.2`)
 
@@ -465,12 +486,12 @@ src/
     controller.ts       # UI state: single + multi-select, impact preview, batch POST, retention policy, in-place list refresh
 test/
   purge-core.test.ts    # ordering, failure-path and batch tests (16 tests)
-  controller.test.ts    # client state machine tests (28 tests)
+  controller.test.ts    # client state machine tests (32 tests)
   api-route.test.ts     # route, origin gate, capability, model-tool refusal and batch tests (36 tests)
-  client-ui.test.ts     # jsdom mount of the real components, real events (30 tests)
+  client-ui.test.ts     # jsdom mount of the real components, real events (32 tests)
   preview.test.ts       # read-only preview route: impact, fences, isolation, and that it mutates nothing (19 tests)
-  policy.test.ts        # policy validation and deterministic selection (30 tests)
-  policy-route.test.ts  # policy preview/apply routes: fences, selection, blocks, and that the preview mutates nothing (20 tests)
+  policy.test.ts        # policy validation and deterministic selection (32 tests)
+  policy-route.test.ts  # policy preview/apply routes: fences, selection, blocks, exclusions, and that the preview mutates nothing (23 tests)
 integration/
   README.md             # host capabilities required for real deletion
 cordis.patch.yml        # how the profile mounts this package (one insert row)
@@ -546,30 +567,33 @@ Seven layers:
   every limit (an empty policy, a non-numeric limit, a fractional count, a
   negative limit are all refused), the age / count / byte budgets and their
   union, the positional byte cut, the session with an unknown size that is kept
-  because it cannot be shown to break the budget, the excluded session that still
-  occupies a count slot, the oldest-first ordering, and that the same store
-  always decides the same way.
+  because it cannot be shown to break the budget — including one that sits past
+  the cut, the excluded session that still occupies a count slot, the
+  oldest-first ordering, and that the same store always decides the same way.
 - `test/policy-route.test.ts` drives the two policy routes through a real cordis
   Context: the route registration, the origin and content-type fences, the
   selection the policy names with its byte total, the 400 for an unusable limit,
-  the 501 for a host that cannot list, that the preview mutates nothing, and the
+  the 501 for a host that cannot list, that the preview mutates nothing (every
+  primitive the cleanup pipeline uses is recorded, not only the delete), and the
   apply — that it removes exactly the sessions the preview named, that it skips a
-  session a live agent holds and reports why, and that the rest of the batch is
-  still removed.
+  session a live agent holds and reports why, that the rest of the batch is
+  still removed, that an excluded session is left alone even when the request
+  names it, and that the bytes of a session whose cleanup failed after its log
+  was deleted still count as freed.
 
 What success looks like (observed):
 
 ```text
  ✓ test/purge-core.test.ts (16 tests) 43ms
- ✓ test/controller.test.ts (28 tests) 39ms
+ ✓ test/controller.test.ts (32 tests) 35ms
  ✓ test/preview.test.ts (19 tests) 379ms
- ✓ test/policy-route.test.ts (20 tests) 187ms
- ✓ test/policy.test.ts (30 tests) 34ms
+ ✓ test/policy-route.test.ts (23 tests) 197ms
+ ✓ test/policy.test.ts (32 tests) 60ms
  ✓ test/api-route.test.ts (36 tests) 342ms
- ✓ test/client-ui.test.ts (30 tests) 535ms
+ ✓ test/client-ui.test.ts (32 tests) 466ms
 
  Test Files  7 passed (7)
-      Tests  179 passed (179)
+      Tests  190 passed (190)
 ```
 
 Exit code 0 on pass (observed). A failing assertion is reported per test by vitest
@@ -699,6 +723,13 @@ Notes:
   `confirm: true`, and the client needs the operator's consent checkbox on top of
   a preview that still matches the limits on screen. Changing a limit drops the
   preview, and the button stays disabled until it is given again.
+- **The origin fence is CSRF protection, not authentication.** A request with no
+  `Origin` header is admitted, so any local process can remove up to 500
+  sessions with `{ "sessionIds": [...], "confirm": true }`. This is the same
+  posture as the existing delete route (200 ids), and the human-consent promise
+  lives in the client checkbox — the server's `confirm: true` is written by the
+  client itself. Keep these routes behind the host's own boundary, and do not
+  expose the port to an untrusted network.
 - **`.gitignore` keeps the dangerous and the generated out of the repository**:
   `node_modules/`, `lib/` (needed on disk for a `link:` install, but regenerated by
   `npm run build`), the `*:Zone.Identifier` sidecars that arrived with a
@@ -767,7 +798,7 @@ cannot prove compatibility, so check your runtime yourself with
 - [ ] You cloned this repository and `cd` into it
 - [ ] `npm install` completed against a registry that publishes `@deepseek-ai/*`
 - [ ] `npm run type-check` exited 0 with no output
-- [ ] `npm test` reported `179 passed (179)`
+- [ ] `npm test` reported `190 passed (190)`
 - [ ] `npm run build` wrote `lib/index.js` and `lib/client.js`
 - [ ] `dsh plugin --profile <name> add link:.` completed
 - [ ] `dsh --profile <name> --dump-config` shows the `session-purge` row

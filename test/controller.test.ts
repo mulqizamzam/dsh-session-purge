@@ -423,9 +423,10 @@ describe('SessionPurgeController — retention policy', () => {
       selectedCount: 2,
       totalSessions: 12,
       bytesToFree: 2048,
-      selectedIds: [ID_A, ID_B],
       truncated: false,
     })
+    expect(controller.getSnapshot().policyPreview?.selected.map(row => row.id)).toEqual([ID_A, ID_B])
+    expect(controller.getSnapshot().policyPreview?.selected[0]).toMatchObject({ ageDays: 40, sizeBytes: 1024 })
   })
 
   it('never lets the policy name the session the operator is viewing', async () => {
@@ -470,11 +471,95 @@ describe('SessionPurgeController — retention policy', () => {
     controller.setPolicyLimit('maxAgeDays', '30')
     await controller.previewPolicy()
     await controller.applyPolicy()
-    expect(policyBody(fetchMock, '/policy/apply')).toEqual({ sessionIds: [ID_A, ID_B], confirm: true })
+    expect(policyBody(fetchMock, '/policy/apply')).toEqual({
+      sessionIds: [ID_A, ID_B],
+      confirm: true,
+      excludeSessionIds: [],
+    })
     expect(refreshList).toHaveBeenCalledTimes(1)
     expect(controller.getSnapshot().policyResult).toEqual({ succeeded: 2, failed: 0, blocked: 0, bytesFreed: 2048 })
     // The preview is dropped: its sessions are gone.
     expect(controller.getSnapshot().policyPreview).toBeNull()
+  })
+
+  it('takes the consent back when a new preview answers a different selection', async () => {
+    let call = 0
+    const { fetchMock } = stubFetch(async (url: unknown) => {
+      if (String(url).includes('/policy/preview')) {
+        call += 1
+        // The second answer names one session more than the first.
+        return jsonResponse(policyPreviewPayload({
+          selectedCount: call === 1 ? 2 : 3,
+          totalSelected: call === 1 ? 2 : 3,
+          selected: [
+            { id: ID_A, exists: true, createdAt: 0, ageDays: 40, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+            { id: ID_B, exists: true, createdAt: 0, ageDays: 35, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+            ...(call === 1
+              ? []
+              : [{ id: ID_C, exists: true, createdAt: 0, ageDays: 33, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' }]),
+          ],
+        }))
+      }
+      return jsonResponse({ ok: true, total: 0, succeeded: 0, failed: 0, blocked: 0, bytesFreed: null, results: [] })
+    })
+    const controller = new SessionPurgeController(vi.fn(async () => {}))
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.previewPolicy()
+    controller.setPolicyAcknowledged(true)
+    expect(controller.getSnapshot().policyAcknowledged).toBe(true)
+    // A new answer is a new selection: the consent given for the old one does
+    // not carry over, or the operator would consent to a session they never saw.
+    await controller.previewPolicy()
+    expect(controller.getSnapshot().policyAcknowledged).toBe(false)
+    expect(controller.getSnapshot().policyPreview?.selected.map(row => row.id)).toEqual([ID_A, ID_B, ID_C])
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('drops the selection and the consent when the operator switches conversation', async () => {
+    const { controller } = policyController()
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.previewPolicy()
+    controller.setPolicyAcknowledged(true)
+    expect(controller.getSnapshot().policyPreview).not.toBeNull()
+    // The session now on screen must never be removed by a selection made
+    // before the switch.
+    controller.setCurrentSession(ID_C)
+    expect(controller.getSnapshot().policyPreview).toBeNull()
+    expect(controller.getSnapshot().policyAcknowledged).toBe(false)
+  })
+
+  it('sends the session being viewed as an exclusion with the run', async () => {
+    const { controller, fetchMock } = policyController()
+    controller.setCurrentSession(ID_C)
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.previewPolicy()
+    await controller.applyPolicy()
+    expect(policyBody(fetchMock, '/policy/apply')).toEqual({
+      sessionIds: [ID_A, ID_B],
+      confirm: true,
+      excludeSessionIds: [ID_C],
+    })
+  })
+
+  it('refuses a limit the host would refuse, before sending it', async () => {
+    const { controller, fetchMock } = policyController()
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '0')
+    await controller.previewPolicy()
+    expect(controller.getSnapshot().policyError).toContain('at least 1')
+    controller.setPolicyLimit('maxAgeDays', '30')
+    controller.setPolicyLimit('maxCount', '2.5')
+    await controller.previewPolicy()
+    expect(controller.getSnapshot().policyError).toContain('whole number')
+    controller.setPolicyLimit('maxCount', '5')
+    controller.setPolicyLimit('maxTotalBytes', '0')
+    await controller.previewPolicy()
+    expect(controller.getSnapshot().policyError).toContain('at least 1')
+    // None of them reached the host.
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('refuses to apply without a preview', async () => {
