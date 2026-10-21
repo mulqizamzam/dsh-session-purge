@@ -6,6 +6,8 @@ const ID = '2de8b71d-bd3b-4f4d-8d1d-5dceac76f934'
 const ID2 = '8f14e45f-ceea-467a-9f1b-2c3d4e5f6a7b'
 const PATH = '/api/session-purge/delete'
 const PREVIEW_PATH = '/api/session-purge/preview'
+const POLICY_PREVIEW_PATH = '/api/session-purge/policy/preview'
+const POLICY_APPLY_PATH = '/api/session-purge/policy/apply'
 
 type RegisteredRoute = {
   path: string
@@ -173,8 +175,9 @@ async function opened(services?: Record<string, object>): Promise<Harness> {
 describe('POST /api/session-purge/delete origin gate', () => {
   it('registers the delete route for POST only', async () => {
     const { routes } = await opened(deleteCapablePersistence([]))
-    // The read-only preview route sits beside the destructive one.
-    expect(routes.map(route => route.path)).toEqual([PATH, PREVIEW_PATH])
+    // The read-only preview route and the two policy routes sit beside the
+    // destructive one.
+    expect(routes.map(route => route.path)).toEqual([PATH, PREVIEW_PATH, POLICY_PREVIEW_PATH, POLICY_APPLY_PATH])
     expect([...routes[0].methods]).toEqual(['POST'])
   })
 

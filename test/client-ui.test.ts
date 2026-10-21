@@ -184,8 +184,10 @@ describe('client slot registration', () => {
       'conversation.session.header.utilities#session-purge-header',
       'sidebar.workspaces.session.menu.item#session-purge-sidebar',
       'sidebar.footer.action#session-purge-select',
+      'sidebar.footer.action#session-purge-retention',
       'shell.overlay#session-purge-dialog',
       'shell.overlay#session-purge-manager',
+      'shell.overlay#session-purge-policy',
     ])
     expect(harness.registrations.every(reg => reg.entry.locale === 'session-purge')).toBe(true)
   })
@@ -201,6 +203,9 @@ describe('client slot registration', () => {
       'running', 'currentSession', 'currentSessionNote', 'retryHint',
       'impactTitle', 'impactAge', 'impactOldest', 'impactTotal', 'impactBlocked', 'impactNothing',
       'impactReasonLive', 'impactReasonInvalid', 'impactReasonRegistry', 'impactReasonStat',
+      'policyLabel', 'policyTitle', 'policyHint', 'policyAgeLabel', 'policyCountLabel', 'policySizeLabel',
+      'policyPreviewAction', 'policyApplyAction', 'policyPreviewTitle', 'policySummary', 'policyTruncated',
+      'policyBlocked', 'policyNothing', 'policyConsent', 'policyResult', 'policyWorking',
     ]
     for (const key of required) {
       expect(typeof en[key], `en.${key}`).toBe('string')
@@ -429,6 +434,242 @@ describe('the confirmation dialog', () => {
     expect(harness.controller.getSnapshot().batch).toBeNull()
     // The list refresh is the client-side half of the row disappearing.
     expect(harness.refreshList).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('the retention policy overlay', () => {
+  function policyPreviewPayload(overrides: Record<string, unknown> = {}): unknown {
+    return {
+      ok: true,
+      totalSessions: 12,
+      selectedCount: 2,
+      totalSelected: 2,
+      keptCount: 10,
+      bytesToFree: 2048,
+      truncated: false,
+      selected: [
+        { id: ID_A, exists: true, createdAt: Date.now(), ageDays: 40, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+        { id: ID_B, exists: true, createdAt: Date.now(), ageDays: 35, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+      ],
+      ...overrides,
+    }
+  }
+
+  async function flush(): Promise<void> {
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+  }
+
+  function numberInputs(container: HTMLElement): HTMLInputElement[] {
+    return [...container.querySelectorAll<HTMLInputElement>('input[type="number"]')]
+  }
+
+  /** React reads the value through its own setter, so the native one is used. */
+  function setInputValue(input: HTMLInputElement, value: string): void {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+    setter?.call(input, value)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+
+  function applyButton(container: HTMLElement): HTMLButtonElement {
+    const button = [...container.querySelectorAll('button')].find(candidate => candidate.textContent?.includes('Apply policy'))
+    if (!button) throw new Error('no apply button')
+    return button as HTMLButtonElement
+  }
+
+  function policyFetch(preview: unknown = policyPreviewPayload(), apply: unknown = {
+    ok: true,
+    total: 2,
+    succeeded: 2,
+    failed: 0,
+    blocked: 0,
+    bytesFreed: 2048,
+    results: [
+      { ok: true, id: ID_A, log: true, cache: true, ledger: true, stage: 'complete', error: '' },
+      { ok: true, id: ID_B, log: true, cache: true, ledger: true, stage: 'complete', error: '' },
+    ],
+  }) {
+    return vi.fn(async (url: unknown, _init?: RequestInit) => {
+      const path = String(url)
+      if (path.includes('/policy/preview')) {
+        return new Response(JSON.stringify(preview), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (path.includes('/policy/apply')) {
+        return new Response(JSON.stringify(apply), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+  }
+
+  it('opens from the sidebar foot', () => {
+    const harness = freshClient()
+    const container = mount(harness, 'session-purge-retention', { wide: true })
+    expect(container.textContent).toContain('Retention')
+    clickButton(container, 'Retention')
+    expect(harness.controller.getSnapshot().policyOpen).toBe(true)
+  })
+
+  it('shows the policy surface with its three limits', () => {
+    const harness = freshClient()
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    expect(container.textContent).toContain('Retention policy')
+    expect(container.textContent).toContain('Keep sessions newer than (days)')
+    expect(container.textContent).toContain('Keep at most (sessions)')
+    expect(container.textContent).toContain('Keep at most (MB)')
+    expect(numberInputs(container)).toHaveLength(3)
+  })
+
+  it('keeps the apply button disabled until a preview exists and the consent is given', async () => {
+    const harness = freshClient()
+    vi.stubGlobal('fetch', policyFetch())
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    expect(applyButton(container).disabled).toBe(true)
+    // The consent alone is not enough: there is nothing selected yet.
+    act(() => { checkboxInputs(container)[0].click() })
+    expect(applyButton(container).disabled).toBe(true)
+    // A limit and a preview are not enough either: typing a limit drops the
+    // consent, because it invalidates the selection the consent was given for.
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    expect(applyButton(container).disabled).toBe(true)
+    act(() => { checkboxInputs(container)[0].click() })
+    expect(applyButton(container).disabled).toBe(false)
+  })
+
+  it('sends the limits the operator typed, with the size in bytes', async () => {
+    const harness = freshClient()
+    const fetchMock = policyFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    const fields = numberInputs(container)
+    act(() => { setInputValue(fields[0], '30') })
+    act(() => { setInputValue(fields[1], '10') })
+    act(() => { setInputValue(fields[2], '2') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    const call = fetchMock.mock.calls.find(candidate => String(candidate[0]).includes('/policy/preview'))
+    const body = JSON.parse(String((call?.[1] as RequestInit | undefined)?.body ?? '{}'))
+    expect(body.policy).toEqual({ maxAgeDays: 30, maxCount: 10, maxTotalBytes: 2 * 1024 * 1024 })
+  })
+
+  it('names the sessions and the bytes the policy would remove', async () => {
+    const harness = freshClient()
+    vi.stubGlobal('fetch', policyFetch())
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    expect(container.textContent).toContain('2 of 12 sessions selected')
+    expect(container.textContent).toContain('2.0 KB')
+  })
+
+  it('removes exactly the sessions the preview named', async () => {
+    const harness = freshClient()
+    const fetchMock = policyFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    act(() => { checkboxInputs(container)[0].click() })
+    await act(async () => { applyButton(container).click() })
+    await flush()
+    const call = fetchMock.mock.calls.find(candidate => String(candidate[0]).includes('/policy/apply'))
+    const body = JSON.parse(String((call?.[1] as RequestInit | undefined)?.body ?? '{}'))
+    expect(body).toEqual({ sessionIds: [ID_A, ID_B], confirm: true })
+    expect(harness.refreshList).toHaveBeenCalledTimes(1)
+    expect(container.textContent).toContain('2 removed')
+  })
+
+  it('drops the preview when a limit changes, so the run cannot act on a stale selection', async () => {
+    const harness = freshClient()
+    vi.stubGlobal('fetch', policyFetch())
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    act(() => { checkboxInputs(container)[0].click() })
+    expect(applyButton(container).disabled).toBe(false)
+    act(() => { setInputValue(numberInputs(container)[1], '5') })
+    expect(applyButton(container).disabled).toBe(true)
+    expect(container.textContent).not.toContain('2 of 12 sessions selected')
+  })
+
+  it('refuses to preview a policy with no limit at all', async () => {
+    const harness = freshClient()
+    const fetchMock = policyFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    clickButton(container, 'Preview policy')
+    await flush()
+    expect(container.textContent).toContain('Set at least one limit')
+    expect(fetchMock.mock.calls.filter(candidate => String(candidate[0]).includes('/policy/preview'))).toHaveLength(0)
+    expect(applyButton(container).disabled).toBe(true)
+  })
+
+  it('never lets the policy name the session the operator is viewing', async () => {
+    const harness = freshClient()
+    const fetchMock = policyFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    act(() => { harness.controller.setCurrentSession(ID_C) })
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    const call = fetchMock.mock.calls.find(candidate => String(candidate[0]).includes('/policy/preview'))
+    const body = JSON.parse(String((call?.[1] as RequestInit | undefined)?.body ?? '{}'))
+    expect(body.excludeSessionIds).toEqual([ID_C])
+  })
+
+  it('reports a failed preview and keeps the destructive button disabled', async () => {
+    const harness = freshClient()
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) => {
+      if (String(url).includes('/policy/preview')) {
+        return new Response(JSON.stringify({ ok: false, error: 'invalid-policy: the policy needs at least one limit' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    expect(container.textContent).toContain('invalid-policy')
+    expect(applyButton(container).disabled).toBe(true)
+  })
+
+  it('reports what the run did, including the sessions it had to skip', async () => {
+    const harness = freshClient()
+    vi.stubGlobal('fetch', policyFetch(policyPreviewPayload(), {
+      ok: false,
+      total: 2,
+      succeeded: 1,
+      failed: 0,
+      blocked: 1,
+      bytesFreed: 1024,
+      results: [{ ok: true, id: ID_A, log: true, cache: true, ledger: true, stage: 'complete', error: '' }],
+    }))
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    act(() => { checkboxInputs(container)[0].click() })
+    await act(async () => { applyButton(container).click() })
+    await flush()
+    expect(container.textContent).toContain('1 removed')
+    expect(container.textContent).toContain('1 skipped')
   })
 })
 

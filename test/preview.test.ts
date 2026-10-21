@@ -6,6 +6,8 @@ const ID = '2de8b71d-bd3b-4f4d-8d1d-5dceac76f934'
 const ID2 = '8f14e45f-ceea-467a-9f1b-2c3d4e5f6a7b'
 const ID3 = 'b1c2d3e4-f5a6-4b7c-8d9e-0f1a2b3c4d5e'
 const PREVIEW_PATH = '/api/session-purge/preview'
+const POLICY_PREVIEW_PATH = '/api/session-purge/policy/preview'
+const POLICY_APPLY_PATH = '/api/session-purge/policy/apply'
 const DELETE_PATH = '/api/session-purge/delete'
 
 // The route ages the stored session against the real clock, so the fixture is
@@ -167,7 +169,7 @@ const SAME_ORIGIN = { host: '127.0.0.1:13080', origin: 'http://127.0.0.1:13080' 
 describe('POST /api/session-purge/preview', () => {
   it('registers the preview route for POST only, beside the delete route', async () => {
     const { routes } = await opened(previewCapableHost().services)
-    expect(routes.map(route => route.path)).toEqual([DELETE_PATH, PREVIEW_PATH])
+    expect(routes.map(route => route.path)).toEqual([DELETE_PATH, PREVIEW_PATH, POLICY_PREVIEW_PATH, POLICY_APPLY_PATH])
     expect([...routes[1].methods]).toEqual(['POST'])
   })
 

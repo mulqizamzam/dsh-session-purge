@@ -21,6 +21,9 @@ type LocaleKey =
   | 'running' | 'currentSession' | 'currentSessionNote' | 'retryHint'
   | 'impactTitle' | 'impactAge' | 'impactOldest' | 'impactTotal' | 'impactBlocked' | 'impactNothing'
   | 'impactReasonLive' | 'impactReasonInvalid' | 'impactReasonRegistry' | 'impactReasonStat'
+  | 'policyLabel' | 'policyTitle' | 'policyHint' | 'policyAgeLabel' | 'policyCountLabel' | 'policySizeLabel'
+  | 'policyPreviewAction' | 'policyApplyAction' | 'policyPreviewTitle' | 'policySummary' | 'policyTruncated'
+  | 'policyBlocked' | 'policyNothing' | 'policyConsent' | 'policyResult' | 'policyWorking'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -62,6 +65,22 @@ const en: LocaleDictOf<typeof NS> = {
   impactReasonInvalid: 'not a valid session id',
   impactReasonRegistry: 'the host exposes no agent registry',
   impactReasonStat: 'the host could not read its metadata',
+  policyLabel: 'Retention',
+  policyTitle: 'Retention policy',
+  policyHint: 'Remove the stored sessions that fall outside your limits. Preview first — nothing is removed until you apply.',
+  policyAgeLabel: 'Keep sessions newer than (days)',
+  policyCountLabel: 'Keep at most (sessions)',
+  policySizeLabel: 'Keep at most (MB)',
+  policyPreviewAction: 'Preview policy',
+  policyApplyAction: 'Apply policy',
+  policyPreviewTitle: 'What the policy would remove',
+  policySummary: '{count} of {total} sessions selected · {size} to free',
+  policyTruncated: 'The policy flags {count} sessions; only the first {shown} are listed. Run it again for the rest.',
+  policyBlocked: '{count} sessions cannot be removed right now.',
+  policyNothing: 'Nothing to remove: every stored session is inside the limits.',
+  policyConsent: 'I understand this permanently removes the selected sessions.',
+  policyResult: '{succeeded} removed · {failed} failed · {blocked} skipped · {size} freed',
+  policyWorking: 'Working…',
 }
 const zh: LocaleDictOf<typeof NS> = {
   delete: '删除会话',
@@ -97,6 +116,22 @@ const zh: LocaleDictOf<typeof NS> = {
   impactReasonInvalid: '不是有效的会话 id',
   impactReasonRegistry: '宿主没有暴露 agent 注册表',
   impactReasonStat: '宿主无法读取其元数据',
+  policyLabel: '保留策略',
+  policyTitle: '保留策略',
+  policyHint: '移除超出您限制范围的已存储会话。请先预览 —— 在应用之前不会移除任何内容。',
+  policyAgeLabel: '保留最近（天）以内的会话',
+  policyCountLabel: '最多保留（个）会话',
+  policySizeLabel: '最多保留（MB）',
+  policyPreviewAction: '预览策略',
+  policyApplyAction: '应用策略',
+  policyPreviewTitle: '策略将移除的内容',
+  policySummary: '已选择 {total} 个会话中的 {count} 个 · 可释放 {size}',
+  policyTruncated: '策略标记了 {count} 个会话，仅列出前 {shown} 个。请再次运行以处理其余部分。',
+  policyBlocked: '当前有 {count} 个会话无法移除。',
+  policyNothing: '无需移除：所有已存储会话都在限制范围内。',
+  policyConsent: '我理解此操作将永久移除所选会话。',
+  policyResult: '已移除 {succeeded} 个 · 失败 {failed} 个 · 跳过 {blocked} 个 · 释放 {size}',
+  policyWorking: '处理中…',
 }
 
 /**
@@ -214,6 +249,28 @@ function FooterSelectButton({ wide, useSessions, controller, t }: FooterProps) {
       style={ghostButtonStyle}
     >
       {wide ? `☑ ${label}` : '☑'}
+    </button>
+  )
+}
+
+/**
+ * The retention entry, beside the manual selection entry.
+ *
+ * The two live side by side on purpose: one removes what the operator picks,
+ * the other removes what a rule picks. Neither opens the other's surface, so
+ * the modal stack stays one deep.
+ */
+function FooterRetentionButton({ wide, controller, t }: FooterProps) {
+  const label = t('policyLabel')
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={() => { controller.openPolicy() }}
+      style={ghostButtonStyle}
+    >
+      {wide ? `🧹 ${label}` : '🧹'}
     </button>
   )
 }
@@ -366,6 +423,141 @@ function ImpactPanel({ impact, t }: { impact: PreviewReport; t: OverlayProps['t'
   )
 }
 
+/**
+ * The retention surface: the operator sets limits, sees what the policy would
+ * remove, and only then removes it.
+ *
+ * The preview is the gate. It names the sessions and the bytes, and the
+ * destructive button stays disabled until the operator acknowledged the
+ * consent — the same contract the single-session dialog keeps. Changing a
+ * limit drops the preview, so the button can never act on a selection that was
+ * computed from different limits.
+ */
+function PolicyOverlay({ controller, t }: OverlayProps) {
+  const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
+  useEffect(() => {
+    if (!state.policyOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !state.policyBusy) controller.closePolicy()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => { window.removeEventListener('keydown', onKeyDown) }
+  }, [state.policyOpen, state.policyBusy, controller])
+  if (!state.policyOpen) return null
+  const preview = state.policyPreview
+  const canApply = preview !== null
+    && preview.selectedIds.length > 0
+    && state.policyAcknowledged
+    && !state.policyBusy
+  const limitField = (
+    label: string,
+    value: string,
+    onChange: (next: string) => void,
+  ) => (
+    <label style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between' }}>
+      <span>{label}</span>
+      <input
+        type="number"
+        min={0}
+        inputMode="decimal"
+        value={value}
+        disabled={state.policyBusy}
+        onChange={event => { onChange(event.target.value) }}
+        style={{ width: 120 }}
+      />
+    </label>
+  )
+  return (
+    <div
+      role="presentation"
+      onMouseDown={event => { if (event.target === event.currentTarget && !state.policyBusy) controller.closePolicy() }}
+      style={{ position: 'fixed', inset: 0, zIndex: 10001, background: '#0008', display: 'grid', placeItems: 'center', padding: 16 }}
+    >
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="session-purge-policy-title"
+        style={{ width: 'min(520px, 100%)', maxHeight: 'min(80vh, 720px)', overflowY: 'auto', padding: 24, borderRadius: 14, background: 'var(--dsh-panel, Canvas)', color: 'var(--dsh-text, CanvasText)', boxShadow: '0 18px 60px #0005' }}
+      >
+        <h2 id="session-purge-policy-title" style={{ marginTop: 0 }}>{t('policyTitle')}</h2>
+        <p style={{ opacity: 0.8, marginTop: 0 }}>{t('policyHint')}</p>
+        <div style={{ display: 'grid', gap: 8, margin: '14px 0' }}>
+          {limitField(t('policyAgeLabel'), state.policyLimits.maxAgeDays, next => { controller.setPolicyLimit('maxAgeDays', next) })}
+          {limitField(t('policyCountLabel'), state.policyLimits.maxCount, next => { controller.setPolicyLimit('maxCount', next) })}
+          {limitField(t('policySizeLabel'), state.policyLimits.maxTotalBytes, next => { controller.setPolicyLimit('maxTotalBytes', next) })}
+        </div>
+        <button
+          type="button"
+          disabled={state.policyBusy}
+          onClick={() => { void controller.previewPolicy() }}
+          style={ghostButtonStyle}
+        >
+          {state.policyBusy ? t('policyWorking') : t('policyPreviewAction')}
+        </button>
+        {preview !== null && (
+          <div style={{ margin: '14px 0', padding: '10px 12px', borderRadius: 10, background: 'var(--dsh-surface, rgba(0,0,0,0.05))' }}>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>{t('policyPreviewTitle')}</div>
+            {preview.selectedCount === 0
+              ? <div style={{ fontSize: 13 }}>{t('policyNothing')}</div>
+              : (
+                <>
+                  <div style={{ fontSize: 13 }}>
+                    {t('policySummary', {
+                      count: preview.selectedCount,
+                      total: preview.totalSessions,
+                      size: formatBytes(preview.bytesToFree),
+                    })}
+                  </div>
+                  {preview.truncated && (
+                    <div style={{ fontSize: 12, opacity: 0.7 }}>
+                      {t('policyTruncated', { count: preview.totalSelected, shown: preview.selectedCount })}
+                    </div>
+                  )}
+                  {preview.blocked.length > 0 && (
+                    <div style={{ fontSize: 12, color: 'var(--dsh-danger, #c33)' }}>
+                      {t('policyBlocked', { count: preview.blocked.length })}
+                    </div>
+                  )}
+                </>
+              )}
+          </div>
+        )}
+        {state.policyResult !== null && (
+          <p style={{ fontSize: 13 }}>
+            {t('policyResult', {
+              succeeded: state.policyResult.succeeded,
+              failed: state.policyResult.failed,
+              blocked: state.policyResult.blocked,
+              size: formatBytes(state.policyResult.bytesFreed),
+            })}
+          </p>
+        )}
+        {state.policyError && <p role="alert" style={{ color: 'var(--dsh-danger, #c33)' }}>{state.policyError}</p>}
+        <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '16px 0' }}>
+          <input
+            type="checkbox"
+            checked={state.policyAcknowledged}
+            disabled={state.policyBusy}
+            onChange={event => { controller.setPolicyAcknowledged(event.target.checked) }}
+          />
+          <span>{t('policyConsent')}</span>
+        </label>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 }}>
+          <button type="button" disabled={state.policyBusy} onClick={() => { controller.closePolicy() }}>{t('cancel')}</button>
+          <button
+            type="button"
+            disabled={!canApply}
+            onClick={() => { void controller.applyPolicy() }}
+            style={{ ...dangerButtonStyle, cursor: canApply ? 'pointer' : 'not-allowed' }}
+          >
+            {t('policyApplyAction')}
+          </button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 function ConfirmOverlay({ controller, t }: OverlayProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
   const [acknowledgedToken, setAcknowledgedToken] = useState<number | null>(null)
@@ -503,6 +695,14 @@ export function apply(ctx: ClientContext): void {
     inject: (): FooterFace => ({ controller }),
   }, FooterSelectButton))
 
+  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
+    name: 'sidebar.footer.action',
+    id: 'session-purge-retention',
+    order: 101,
+    locale: NS,
+    inject: (): FooterFace => ({ controller }),
+  }, FooterRetentionButton))
+
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
     id: 'session-purge-dialog',
@@ -517,4 +717,12 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: () => ({ controller }),
   }, SelectionManager))
+
+  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'session-purge-policy',
+    order: 1001,
+    locale: NS,
+    inject: () => ({ controller }),
+  }, PolicyOverlay))
 }

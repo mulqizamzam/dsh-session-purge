@@ -10,7 +10,7 @@ import { normalizeSessionId, SessionPurgeError } from './purge-core.ts'
 
 /** The host's stored-session snapshot, read defensively. */
 export interface StoredSessionSnapshot {
-  readonly header?: { readonly createdAt?: number }
+  readonly header?: { readonly id?: string; readonly createdAt?: number }
   readonly sizeBytes?: number
 }
 
@@ -67,6 +67,76 @@ export interface PreviewReport {
 
 const MILLISECONDS_PER_DAY = 86_400_000
 
+/**
+ * Age in days, rounded to one decimal.
+ *
+ * The rounding is the number the operator is shown, so every rule that reads
+ * an age (the impact panel, the retention policy) must read this same value —
+ * a policy that silently used a different precision would select a session the
+ * panel described as still inside the limit.
+ * @param createdAt - the stored session's creation time, epoch milliseconds.
+ * @param now - the reference time, epoch milliseconds.
+ * @returns the age in days, never negative.
+ */
+export function ageInDays(createdAt: number, now: number): number {
+  return Math.max(0, Math.round(((now - createdAt) / MILLISECONDS_PER_DAY) * 10) / 10)
+}
+
+/** A finite number, or null when the host reported nothing usable. */
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/** What the host already reported about one stored session. */
+export interface SessionFacts {
+  /** A stored log exists for this id. */
+  readonly exists: boolean
+  /** The stored session's creation time, epoch milliseconds. */
+  readonly createdAt: number | null
+  /** The stored artifact's physical size in bytes. */
+  readonly sizeBytes: number | null
+}
+
+/**
+ * Describe one session from facts the host already reported.
+ *
+ * The live-agent rules are the same ones the purge pipeline obeys, so the
+ * description can never promise something the delete would refuse: without an
+ * agent registry the pipeline cannot even look for a live agent and answers
+ * `runtime-capability-missing`, and a live agent is only removable when the
+ * host owns a disposal bridge or the agent itself can be stopped.
+ * @param id - the normalized session id.
+ * @param facts - what the host reported about the stored session.
+ * @param runtime - the host's live state.
+ * @param now - the reference time, epoch milliseconds.
+ */
+export function describeSession(
+  id: string,
+  facts: SessionFacts,
+  runtime: SessionPreviewRuntime,
+  now: number,
+): SessionImpact {
+  const liveAgent = runtime.liveAgentState(id)
+  const attached = runtime.isAttached(id)
+  let blockedReason = ''
+  if (liveAgent === 'unknown') {
+    blockedReason = 'agent-registry-unavailable'
+  } else if (liveAgent === 'live' && !runtime.canStopAndDrain(id)) {
+    blockedReason = 'session-live'
+  }
+  return {
+    id,
+    exists: facts.exists,
+    createdAt: facts.createdAt,
+    ageDays: facts.createdAt === null ? null : ageInDays(facts.createdAt, now),
+    sizeBytes: facts.sizeBytes,
+    liveAgent,
+    attached,
+    deletable: facts.exists && blockedReason === '',
+    blockedReason,
+  }
+}
+
 function impact(id: string, extra: Partial<SessionImpact>): SessionImpact {
   return {
     id,
@@ -112,35 +182,11 @@ export async function previewSession(
     // No stored log: nothing to remove, and the delete is a successful no-op.
     return impact(id, {})
   }
-  const createdAt = typeof snapshot.header?.createdAt === 'number' && Number.isFinite(snapshot.header.createdAt)
-    ? snapshot.header.createdAt
-    : null
-  const sizeBytes = typeof snapshot.sizeBytes === 'number' && Number.isFinite(snapshot.sizeBytes)
-    ? snapshot.sizeBytes
-    : null
-  const liveAgent = runtime.liveAgentState(id)
-  const attached = runtime.isAttached(id)
-  let blockedReason = ''
-  if (liveAgent === 'unknown') {
-    // The purge pipeline cannot look for a live agent without this registry and
-    // answers 501 for it; the preview must not call that "deletable".
-    blockedReason = 'agent-registry-unavailable'
-  } else if (liveAgent === 'live' && !runtime.canStopAndDrain(id)) {
-    blockedReason = 'session-live'
-  }
-  return {
-    id,
+  return describeSession(id, {
     exists: true,
-    createdAt,
-    ageDays: createdAt === null
-      ? null
-      : Math.max(0, Math.round(((now - createdAt) / MILLISECONDS_PER_DAY) * 10) / 10),
-    sizeBytes,
-    liveAgent,
-    attached,
-    deletable: blockedReason === '',
-    blockedReason,
-  }
+    createdAt: finiteOrNull(snapshot.header?.createdAt),
+    sizeBytes: finiteOrNull(snapshot.sizeBytes),
+  }, runtime, now)
 }
 
 /**

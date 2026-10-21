@@ -2,8 +2,8 @@
 
 ## Overview
 
-A DSH plugin with two halves: a Node host half that registers two HTTP endpoints
-(one destructive, one read-only) and one model-facing guidance tool, and a browser
+A DSH plugin with two halves: a Node host half that registers four HTTP endpoints
+(two destructive, two read-only) and one model-facing guidance tool, and a browser
 client half that adds a human-confirmed **Delete session** action to the session
 header and to the sidebar session menu. It is for people running a DSH profile who
 want permanent session deletion to be impossible without a human ticking a checkbox
@@ -17,12 +17,16 @@ Every headline feature is traceable to a file:
 | `Delete session` entry in the session "…" menu | `src/client/index.tsx`, slot `sidebar.workspaces.session.menu.item` |
 | Irreversible-action dialog with a checkbox | `src/client/index.tsx`, component `ConfirmOverlay` |
 | Impact panel in the dialog (size, age, blocked sessions) | `src/client/index.tsx`, component `ImpactPanel` |
+| 🧹 `Retention` entry and the policy surface | `src/client/index.tsx`, components `FooterRetentionButton` and `PolicyOverlay` |
 | `session_purge` guidance tool for the model | `src/index.ts` |
 | `POST /api/session-purge/delete` endpoint | `src/index.ts` |
 | `POST /api/session-purge/preview` endpoint (read-only) | `src/index.ts` |
+| `POST /api/session-purge/policy/preview` endpoint (read-only) | `src/index.ts` |
+| `POST /api/session-purge/policy/apply` endpoint | `src/index.ts` |
 | Capability-detected bridge to host services | `src/runtime-adapter.ts` |
 | Ordered, fail-closed cleanup | `src/purge-core.ts`, covered by `test/purge-core.test.ts` |
 | Read-only impact report | `src/preview-core.ts`, covered by `test/preview.test.ts` |
+| Retention policy selection | `src/policy-core.ts`, covered by `test/policy.test.ts` |
 
 This is not turnkey on stock upstream DSH. The published persistence contract does
 not provide `sessionPersistence.delete()`, and this plugin fails closed when a
@@ -107,6 +111,131 @@ Response:
   deletes — only the consent checkbox gates the destructive button. After a
   partial batch failure the panel is read again for the pending remainder, so it
   never describes sessions that are already gone.
+
+## Retention policy (preview, then apply)
+
+The plugin had two ways to remove a session — one session, or a hand-picked
+batch. The third way removes what a **rule** selects: the sessions that fall
+outside the operator's limits. It is the surface for a store that grew on its
+own.
+
+The policy has three limits, and they are independent budgets:
+
+| Limit | Meaning |
+|---|---|
+| `maxAgeDays` | Sessions older than this many days are removed. |
+| `maxCount` | At most this many sessions are kept; the older ones are removed. |
+| `maxTotalBytes` | At most this many bytes are kept; the older ones are removed. |
+
+At least one limit must be set. A session is removed when it breaks **any one**
+of the budgets, so the selection is their union.
+
+### Preview the policy
+
+`POST /api/session-purge/policy/preview` answers what a policy would remove.
+It is read-only: it calls no removal primitive, and it needs no `confirm`.
+
+```json
+{
+  "policy": { "maxAgeDays": 30, "maxCount": 50, "maxTotalBytes": 104857600 },
+  "excludeSessionIds": ["<uuid>"]
+}
+```
+
+```json
+{
+  "ok": true,
+  "policy": { "maxAgeDays": 30, "maxCount": 50, "maxTotalBytes": 104857600 },
+  "totalSessions": 128,
+  "selectedCount": 12,
+  "totalSelected": 12,
+  "keptCount": 116,
+  "bytesToFree": 4821304,
+  "bytesKept": 91200432,
+  "selected": [
+    {
+      "id": "2de8b71d-bd3b-4f4d-8d1d-5dceac76f934",
+      "exists": true,
+      "createdAt": 1760000000000,
+      "ageDays": 31.2,
+      "sizeBytes": 300144,
+      "liveAgent": "idle",
+      "attached": false,
+      "deletable": true,
+      "blockedReason": ""
+    }
+  ],
+  "excludedIds": ["2de8b71d-bd3b-4f4d-8d1d-5dceac76f934"],
+  "truncated": false
+}
+```
+
+- The selection is **deterministic**. The host's `list()` promises no order, so
+  the policy sorts by creation time (newest first) and breaks ties on the id.
+  Two runs over the same store always select the same sessions.
+- The age is the same rounded age the impact panel shows, so a session that
+  reads as `30.0` days old is inside a 30-day limit.
+- The byte budget is **positional**: the newest sessions are kept while their
+  known sizes fit under the cap, and everything past that point is selected. A
+  session whose size the host did not report is kept — its size cannot be shown
+  to break the budget, and this tool only removes what it can show is over the
+  limit.
+- The budgets are evaluated over *all* stored sessions, including the excluded
+  ones: an excluded session still occupies a count slot and still holds bytes.
+  Excluding it may only keep it, never move the cut.
+- `selectedCount` is what one run removes (at most 500 sessions); `totalSelected`
+  is what the policy flags in total. When they differ, `truncated` is `true` and
+  the operator runs it again for the rest.
+- A host that cannot list its stored sessions answers HTTP 501 with
+  `runtime-capability-missing`. The delete and preview routes are unaffected.
+
+### Apply the policy
+
+`POST /api/session-purge/policy/apply` runs the ordinary purge pipeline over
+the selected sessions. It is destructive, so it needs `confirm: true`.
+
+```json
+{ "sessionIds": ["<uuid>", "<uuid>"], "confirm": true }
+```
+
+```json
+{ "policy": { "maxAgeDays": 30 }, "confirm": true }
+```
+
+Sending `sessionIds` is what the UI does: the run then removes exactly the
+sessions the preview named. Sending only `policy` lets the host select them
+again. Either way the host re-reads its own state before removing anything, so
+a session that became live in between is reported instead of deleted.
+
+```json
+{
+  "ok": true,
+  "total": 12,
+  "succeeded": 11,
+  "failed": 0,
+  "blocked": 1,
+  "bytesFreed": 4500000,
+  "results": [ { "ok": true, "id": "<uuid>", "log": true, "cache": true, "ledger": true, "stage": "complete", "error": "" } ],
+  "blockedResults": [ { "id": "<uuid>", "reason": "session-live" } ]
+}
+```
+
+- `blocked` counts the sessions something stood in the way of (a live agent the
+  host can neither dispose nor stop). They are not removed and not counted as
+  failures.
+- The status code follows the delete route's order: `400` for a malformed
+  request, `409` for a blocked session, `501` for a host that cannot delete at
+  all, `500` for a genuine per-item failure, `200` for a clean run.
+- The client requires an explicit consent checkbox, and the button stays
+  disabled until the preview exists — and typing a new limit drops the preview,
+  so a run can never act on a selection the operator never saw.
+
+### The retention surface in the client
+
+The sidebar foot carries a second entry next to the manual selection button:
+🧹 **Retention**. It opens the policy surface with the three limits, a
+**Preview policy** button and an **Apply policy** button. The session the
+operator is currently viewing is excluded from every policy request.
 
 ## Compatibility notes (verified against DSH `0.2.0-rc.2`)
 
@@ -255,6 +384,21 @@ One worked example, from install to the expected outcome.
 5. On success the selection is cleared, the manager closes, and the list
    refreshes in place.
 
+**Retention path.** The sidebar foot carries a second entry next to
+`Select sessions`: 🧹 `Retention` (accessible name `Retention`):
+
+1. Click it; the policy surface opens with three limits — keep sessions newer
+   than (days), keep at most (sessions), keep at most (MB). At least one must be
+   set.
+2. `Preview policy` asks the host what the policy would remove and shows the
+   selection with the bytes it would free. Nothing is removed yet.
+3. `Apply policy` stays disabled until the operator ticks the consent checkbox.
+   Typing a new limit drops the preview, so the button can never act on a
+   selection that was computed from different limits.
+4. The host removes the named sessions one at a time and reports what happened:
+   how many were removed, how many failed, how many were skipped because
+   something still holds them, and how many bytes were freed.
+
 **Request contract.** The handler itself was invoked directly and returned exactly
 this (a unit-level run that bypasses the host's transport):
 
@@ -311,19 +455,22 @@ http://127.0.0.1:13080` → 401 (fence passed, auth failed), foreign `Origin` �
 
 ```text
 src/
-  index.ts              # host half: session_purge tool + delete and preview endpoints (start here)
+  index.ts              # host half: session_purge tool + delete, preview and policy endpoints (start here)
   purge-core.ts         # ordered cleanup, pure and host-independent
   preview-core.ts       # read-only impact report, pure and host-independent
+  policy-core.ts        # retention policy selection, pure and host-independent
   runtime-adapter.ts    # capability-detected bridge; every missing method fails closed
   client/
-    index.tsx           # slot injections, locale dictionaries (en, zh), confirm dialog, impact panel, selection manager
-    controller.ts       # UI state: single + multi-select, impact preview, batch POST, in-place list refresh
+    index.tsx           # slot injections, locale dictionaries (en, zh), confirm dialog, impact panel, selection manager, policy surface
+    controller.ts       # UI state: single + multi-select, impact preview, batch POST, retention policy, in-place list refresh
 test/
   purge-core.test.ts    # ordering, failure-path and batch tests (16 tests)
-  controller.test.ts    # client state machine tests (17 tests)
+  controller.test.ts    # client state machine tests (27 tests)
   api-route.test.ts     # route, origin gate, capability, model-tool refusal and batch tests (36 tests)
-  client-ui.test.ts     # jsdom mount of the real components, real events (19 tests)
+  client-ui.test.ts     # jsdom mount of the real components, real events (30 tests)
   preview.test.ts       # read-only preview route: impact, fences, isolation, and that it mutates nothing (19 tests)
+  policy.test.ts        # policy validation and deterministic selection (30 tests)
+  policy-route.test.ts  # policy preview/apply routes: fences, selection, blocks, and that the preview mutates nothing (19 tests)
 integration/
   README.md             # host capabilities required for real deletion
 cordis.patch.yml        # how the profile mounts this package (one insert row)
@@ -361,9 +508,9 @@ dsh plugin --profile <name> remove dsh-session-purge
 ## Testing
 
 Runner: vitest, invoked as `npm test`. There is no `vitest.config.*` file, so
-vitest's defaults pick up the five files under `test/`.
+vitest's defaults pick up the seven files under `test/`.
 
-Five layers:
+Seven layers:
 
 - `test/purge-core.test.ts` drives `purgeSession` and `purgeSessions` against a
   fake `SessionPurgeRuntime` and asserts ordering, failure paths, signal
@@ -395,18 +542,34 @@ Five layers:
   with a 501 delete on a host without the agent registry, and that a preview of a
   deletable batch calls **no** mutating primitive (`delete`, `closeSession`,
   `flush`, `purge`, `releaseSession` are all recorded and all stay empty).
+- `test/policy.test.ts` drives the policy core without a host: the validation of
+  every limit (an empty policy, a non-numeric limit, a fractional count, a
+  negative limit are all refused), the age / count / byte budgets and their
+  union, the positional byte cut, the session with an unknown size that is kept
+  because it cannot be shown to break the budget, the excluded session that still
+  occupies a count slot, the oldest-first ordering, and that the same store
+  always decides the same way.
+- `test/policy-route.test.ts` drives the two policy routes through a real cordis
+  Context: the route registration, the origin and content-type fences, the
+  selection the policy names with its byte total, the 400 for an unusable limit,
+  the 501 for a host that cannot list, that the preview mutates nothing, and the
+  apply — that it removes exactly the sessions the preview named, that it skips a
+  session a live agent holds and reports why, and that the rest of the batch is
+  still removed.
 
 What success looks like (observed):
 
 ```text
  ✓ test/purge-core.test.ts (16 tests) 43ms
- ✓ test/controller.test.ts (17 tests) 154ms
- ✓ test/preview.test.ts (19 tests) 672ms
- ✓ test/api-route.test.ts (36 tests) 812ms
- ✓ test/client-ui.test.ts (19 tests) 427ms
+ ✓ test/controller.test.ts (27 tests) 57ms
+ ✓ test/preview.test.ts (19 tests) 379ms
+ ✓ test/policy-route.test.ts (19 tests) 214ms
+ ✓ test/policy.test.ts (30 tests) 34ms
+ ✓ test/api-route.test.ts (36 tests) 342ms
+ ✓ test/client-ui.test.ts (30 tests) 535ms
 
- Test Files  5 passed (5)
-      Tests  107 passed (107)
+ Test Files  7 passed (7)
+      Tests  177 passed (177)
 ```
 
 Exit code 0 on pass (observed). A failing assertion is reported per test by vitest
@@ -526,6 +689,16 @@ Notes:
   how large they are, how old they are, and whether a live agent holds them. That
   is a smaller exposure than the delete route it sits beside, but it is a new one;
   keep the route behind the same host boundary as the delete route.
+- **The policy preview is the same kind of surface, one level up.** It reads the
+  host's whole inventory of stored sessions, so a local non-browser process can
+  learn how many sessions there are and which ones a limit would select. It
+  deletes nothing and needs no `confirm`, but it answers with the shape of the
+  operator's own policy.
+- **The policy apply is the most destructive route in the package.** It removes
+  sessions that nobody picked by hand, so it is fenced twice: the request needs
+  `confirm: true`, and the client needs the operator's consent checkbox on top of
+  a preview that still matches the limits on screen. Changing a limit drops the
+  preview, and the button stays disabled until it is given again.
 - **`.gitignore` keeps the dangerous and the generated out of the repository**:
   `node_modules/`, `lib/` (needed on disk for a `link:` install, but regenerated by
   `npm run build`), the `*:Zone.Identifier` sidecars that arrived with a
@@ -554,6 +727,22 @@ No. `POST /api/session-purge/preview` reads stored-session metadata and calls no
 removal primitive. `test/preview.test.ts` asserts that a preview of a deletable
 batch leaves `sessionPersistence.delete` uncalled.
 
+**What does the retention policy remove?**
+The sessions that break one of the three limits: older than `maxAgeDays`, beyond
+the `maxCount` newest, or beyond the byte budget. The selection is deterministic
+and it is shown before anything happens — the 🧹 **Retention** entry in the
+sidebar foot opens the limits, the preview names the sessions and the bytes, and
+only **Apply policy** removes them. The session you are viewing is never
+selected.
+
+**Will the policy delete a session that is still running?**
+No. The host's live-agent rules are the same ones the manual delete obeys, so a
+session a live agent holds is reported as skipped instead of removed.
+
+**Can I undo a policy run?**
+No. Like every other deletion in this plugin it is one-way, and the dialog says
+so.
+
 **Where do the buttons come from?**
 Slot injections in `src/client/index.tsx`. They exist only where the host runs the
 `web` platform half of the client module system.
@@ -578,7 +767,7 @@ cannot prove compatibility, so check your runtime yourself with
 - [ ] You cloned this repository and `cd` into it
 - [ ] `npm install` completed against a registry that publishes `@deepseek-ai/*`
 - [ ] `npm run type-check` exited 0 with no output
-- [ ] `npm test` reported `107 passed (107)`
+- [ ] `npm test` reported `177 passed (177)`
 - [ ] `npm run build` wrote `lib/index.js` and `lib/client.js`
 - [ ] `dsh plugin --profile <name> add link:.` completed
 - [ ] `dsh --profile <name> --dump-config` shows the `session-purge` row

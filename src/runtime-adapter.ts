@@ -2,6 +2,7 @@ import {
   SessionPurgeError,
   type SessionPurgeRuntime,
 } from './purge-core.ts'
+import type { SessionPolicyRuntime } from './policy-core.ts'
 import type { LiveAgentState, SessionPreviewRuntime, StoredSessionSnapshot } from './preview-core.ts'
 
 /**
@@ -14,6 +15,7 @@ interface LooseService {
   stop?: () => Promise<unknown> | unknown
   delete?: (id: string, options?: { signal?: AbortSignal }) => Promise<unknown>
   stat?: (id: string) => Promise<unknown>
+  list?: (options?: { signal?: AbortSignal }) => Promise<unknown>
   listSync?: () => readonly { id?: string }[]
   purge?: (id: string) => Promise<boolean>
   releaseSession?: (id: string) => Promise<unknown> | unknown
@@ -290,6 +292,41 @@ export function createPreviewAdapter(resolve: ServiceResolver): SessionPreviewRu
       const sessions = resolve('sessions')
       if (!sessions || typeof sessions.get !== 'function') return false
       return Boolean(sessions.get(id))
+    },
+  }
+}
+
+/**
+ * Build the policy half of the adapter: the host's list of stored sessions,
+ * on top of the same live-state rules the preview and the purge obey.
+ *
+ * `sessionPersistence.list()` is the host's own inventory of stored sessions
+ * — the contract the retention policy needs and the one the host already
+ * implements for its session list. It promises no order, so the policy core
+ * decides everything against an explicit ordering of its own.
+ */
+export function createPolicyAdapter(resolve: ServiceResolver): SessionPolicyRuntime {
+  const preview = createPreviewAdapter(resolve)
+  return {
+    statSession: preview.statSession,
+    liveAgentState: preview.liveAgentState,
+    canStopAndDrain: preview.canStopAndDrain,
+    isAttached: preview.isAttached,
+    async listSessions(signal) {
+      const persistence = resolve('sessionPersistence')
+      if (!persistence || typeof persistence.list !== 'function') {
+        throw new SessionPurgeError(
+          'runtime-capability-missing',
+          'validate',
+          'The persistence service cannot list stored sessions; the retention policy is unavailable.',
+        )
+      }
+      const list = persistence.list as (options?: { signal?: AbortSignal }) => Promise<unknown>
+      const snapshots = await list.call(persistence, { signal })
+      // A host that answers with something else is answered with an empty
+      // inventory: the policy then selects nothing, which is safe, where
+      // guessing at the shape would not be.
+      return Array.isArray(snapshots) ? snapshots as StoredSessionSnapshot[] : []
     },
   }
 }

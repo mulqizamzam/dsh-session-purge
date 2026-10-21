@@ -334,3 +334,162 @@ describe('SessionPurgeController — batch deletion', () => {
     expect(controller.getSnapshot().itemFailures[2].error).toContain('HTTP 500')
   })
 })
+
+/** The body of the last request whose path contains `path`. */
+function policyBody(fetchMock: ReturnType<typeof vi.fn>, path: string): Record<string, unknown> {
+  const call = fetchMock.mock.calls.filter(candidate => String(candidate[0]).includes(path)).at(-1)
+  const init = call?.[1] as RequestInit | undefined
+  return JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+}
+
+function policyPreviewPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ok: true,
+    totalSessions: 12,
+    selectedCount: 2,
+    totalSelected: 2,
+    keptCount: 10,
+    bytesToFree: 2048,
+    truncated: false,
+    selected: [
+      { id: ID_A, exists: true, createdAt: 0, ageDays: 40, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+      { id: ID_B, exists: true, createdAt: 0, ageDays: 35, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+    ],
+    ...overrides,
+  }
+}
+
+/** A controller whose fetch answers the two policy routes differently. */
+function policyController(preview: unknown = policyPreviewPayload(), apply: unknown = {
+  ok: true,
+  total: 2,
+  succeeded: 2,
+  failed: 0,
+  blocked: 0,
+  bytesFreed: 2048,
+  results: [okResult(ID_A), okResult(ID_B)],
+}) {
+  const { fetchMock } = stubFetch(async (url: unknown) => {
+    const path = String(url)
+    if (path.includes('/policy/preview')) return jsonResponse(preview)
+    if (path.includes('/policy/apply')) return jsonResponse(apply)
+    return jsonResponse({ ok: true })
+  })
+  const refreshList = vi.fn(async () => {})
+  return { controller: new SessionPurgeController(refreshList), fetchMock, refreshList }
+}
+
+describe('SessionPurgeController — retention policy', () => {
+  it('refuses to open the policy surface while a delete is in flight', async () => {
+    const { controller, settle } = pendingController()
+    controller.open(ID_A, 'alpha')
+    const inFlight = controller.confirm()
+    controller.openPolicy()
+    expect(controller.getSnapshot().policyOpen).toBe(false)
+    settle(jsonResponse(okResult(ID_A)))
+    await inFlight
+  })
+
+  it('sends the limits the operator typed and keeps the answer', async () => {
+    const { controller, fetchMock } = policyController()
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    controller.setPolicyLimit('maxTotalBytes', '2')
+    await controller.previewPolicy()
+    expect(policyBody(fetchMock, '/policy/preview')).toEqual({
+      policy: { maxAgeDays: 30, maxTotalBytes: 2 * 1024 * 1024 },
+      excludeSessionIds: [],
+    })
+    expect(controller.getSnapshot().policyPreview).toMatchObject({
+      selectedCount: 2,
+      totalSessions: 12,
+      bytesToFree: 2048,
+      selectedIds: [ID_A, ID_B],
+      truncated: false,
+    })
+  })
+
+  it('never lets the policy name the session the operator is viewing', async () => {
+    const { controller, fetchMock } = policyController()
+    controller.setCurrentSession(ID_C)
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.previewPolicy()
+    expect(policyBody(fetchMock, '/policy/preview').excludeSessionIds).toEqual([ID_C])
+  })
+
+  it('refuses a policy with no limit and asks for no request at all', async () => {
+    const { controller, fetchMock } = policyController()
+    controller.openPolicy()
+    await controller.previewPolicy()
+    expect(controller.getSnapshot().policyError).toContain('at least one limit')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('refuses a limit that is not a number', async () => {
+    const { controller, fetchMock } = policyController()
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', 'thirty')
+    await controller.previewPolicy()
+    expect(controller.getSnapshot().policyError).toContain('must be a number')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('drops the preview when a limit changes', async () => {
+    const { controller } = policyController()
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.previewPolicy()
+    expect(controller.getSnapshot().policyPreview).not.toBeNull()
+    controller.setPolicyLimit('maxCount', '5')
+    expect(controller.getSnapshot().policyPreview).toBeNull()
+  })
+
+  it('applies exactly the sessions the preview named', async () => {
+    const { controller, fetchMock, refreshList } = policyController()
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.previewPolicy()
+    await controller.applyPolicy()
+    expect(policyBody(fetchMock, '/policy/apply')).toEqual({ sessionIds: [ID_A, ID_B], confirm: true })
+    expect(refreshList).toHaveBeenCalledTimes(1)
+    expect(controller.getSnapshot().policyResult).toEqual({ succeeded: 2, failed: 0, blocked: 0, bytesFreed: 2048 })
+    // The preview is dropped: its sessions are gone.
+    expect(controller.getSnapshot().policyPreview).toBeNull()
+  })
+
+  it('refuses to apply without a preview', async () => {
+    const { controller, fetchMock } = policyController()
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.applyPolicy()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps the host error and no preview when the host refuses the policy', async () => {
+    const { controller } = policyController({ ok: false, error: 'invalid-policy: the policy needs at least one limit' })
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.previewPolicy()
+    expect(controller.getSnapshot().policyPreview).toBeNull()
+    expect(controller.getSnapshot().policyError).toContain('invalid-policy')
+  })
+
+  it('reports a run that skipped a session instead of failing flat', async () => {
+    const { controller } = policyController(policyPreviewPayload(), {
+      ok: false,
+      total: 2,
+      succeeded: 1,
+      failed: 0,
+      blocked: 1,
+      bytesFreed: 1024,
+      results: [okResult(ID_A)],
+    })
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    await controller.previewPolicy()
+    await controller.applyPolicy()
+    expect(controller.getSnapshot().policyResult).toEqual({ succeeded: 1, failed: 0, blocked: 1, bytesFreed: 1024 })
+    expect(controller.getSnapshot().policyError).toBeNull()
+  })
+})

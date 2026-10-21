@@ -4,6 +4,10 @@ import type { PreviewReport } from '../preview-core.ts'
 
 const DELETE_PATH = '/api/session-purge/delete'
 const PREVIEW_PATH = '/api/session-purge/preview'
+const POLICY_PREVIEW_PATH = '/api/session-purge/policy/preview'
+const POLICY_APPLY_PATH = '/api/session-purge/policy/apply'
+
+const BYTES_PER_MEGABYTE = 1024 * 1024
 
 /** One listable session as the selection manager shows it. */
 export interface SessionRow {
@@ -36,6 +40,33 @@ export interface ItemFailure {
   readonly error: string
 }
 
+/** The retention limits as the operator typed them; an empty field is unset. */
+export interface PolicyLimits {
+  readonly maxAgeDays: string
+  readonly maxCount: string
+  readonly maxTotalBytes: string
+}
+
+/** What the host said a policy would remove. */
+export interface PolicyPreviewSummary {
+  readonly selectedCount: number
+  /** How many sessions the policy flags in total, before the run cap. */
+  readonly totalSelected: number
+  readonly totalSessions: number
+  readonly bytesToFree: number | null
+  readonly selectedIds: readonly string[]
+  readonly blocked: readonly { readonly id: string; readonly reason: string }[]
+  readonly truncated: boolean
+}
+
+/** What one policy run did. */
+export interface PolicyApplySummary {
+  readonly succeeded: number
+  readonly failed: number
+  readonly blocked: number
+  readonly bytesFreed: number | null
+}
+
 export interface PurgeUiState {
   readonly target: DeleteTarget | null
   readonly batch: BatchDialog | null
@@ -51,9 +82,62 @@ export interface PurgeUiState {
   readonly itemFailures: readonly ItemFailure[]
   /** What the pending deletion would remove; null until the host answers. */
   readonly impact: PreviewReport | null
+  /** The retention overlay is open. */
+  readonly policyOpen: boolean
+  /** A policy request is in flight. */
+  readonly policyBusy: boolean
+  readonly policyError: string | null
+  readonly policyLimits: PolicyLimits
+  /** What the last policy preview selected; null until the operator previews. */
+  readonly policyPreview: PolicyPreviewSummary | null
+  /** What the last policy run did; null until the operator applies. */
+  readonly policyResult: PolicyApplySummary | null
+  /** The operator acknowledged that a policy run removes sessions permanently. */
+  readonly policyAcknowledged: boolean
 }
 
 type Listener = () => void
+
+/** The host's answer to a policy preview. */
+interface PolicyPreviewPayload {
+  ok?: boolean
+  error?: string
+  totalSessions?: number
+  selectedCount?: number
+  totalSelected?: number
+  bytesToFree?: number | null
+  truncated?: boolean
+  selected?: { id?: string; blockedReason?: string }[]
+}
+
+/** The host's answer to a policy run. */
+interface PolicyApplyPayload {
+  ok?: boolean
+  error?: string
+  succeeded?: number
+  failed?: number
+  blocked?: number
+  bytesFreed?: number | null
+  results?: unknown[]
+}
+
+/**
+ * One typed limit.
+ *
+ * An empty field is an unset limit; anything that is not a number is refused
+ * here, where the operator can still see what they typed.
+ * @param raw - the field's text.
+ * @param name - how the field is called in the operator's language.
+ */
+function parseLimit(raw: string, name: string): number | undefined {
+  const trimmed = raw.trim()
+  if (trimmed.length === 0) return undefined
+  const value = Number(trimmed)
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a number.`)
+  }
+  return value
+}
 
 export class SessionPurgeController {
   private state: PurgeUiState = {
@@ -67,6 +151,13 @@ export class SessionPurgeController {
     error: null,
     itemFailures: [],
     impact: null,
+    policyOpen: false,
+    policyBusy: false,
+    policyError: null,
+    policyLimits: { maxAgeDays: '', maxCount: '', maxTotalBytes: '' },
+    policyPreview: null,
+    policyResult: null,
+    policyAcknowledged: false,
   }
   private readonly listeners = new Set<Listener>()
   private nextToken = 1
@@ -169,14 +260,204 @@ export class SessionPurgeController {
   }
 
   /**
+   * Open the retention overlay.
+   *
+   * A purge in flight owns the dialog state, so the policy overlay waits: two
+   * destructive flows running at once would race over the same sessions.
+   */
+  openPolicy(): void {
+    if (this.state.busy || this.state.policyBusy) return
+    this.setState({
+      ...this.state,
+      policyOpen: true,
+      policyError: null,
+      policyPreview: null,
+      policyResult: null,
+      policyAcknowledged: false,
+    })
+  }
+
+  closePolicy(): void {
+    if (this.state.policyBusy) return
+    this.setState({ ...this.state, policyOpen: false, policyError: null })
+  }
+
+  /**
+   * Change one limit.
+   *
+   * The preview goes with it: a preview that answered different limits would
+   * let the operator apply a selection they never saw.
+   */
+  setPolicyLimit(key: keyof PolicyLimits, value: string): void {
+    if (this.state.policyBusy) return
+    this.setState({
+      ...this.state,
+      policyLimits: { ...this.state.policyLimits, [key]: value },
+      policyPreview: null,
+      policyResult: null,
+      policyAcknowledged: false,
+      policyError: null,
+    })
+  }
+
+  /** Record the operator's consent for the destructive half of the policy. */
+  setPolicyAcknowledged(acknowledged: boolean): void {
+    if (this.state.policyBusy) return
+    this.setState({ ...this.state, policyAcknowledged: acknowledged })
+  }
+
+  /**
+   * Ask the host what the policy would remove.
+   *
+   * Nothing is removed here: the answer only names sessions and bytes, and the
+   * apply button stays gated on the operator's consent.
+   */
+  async previewPolicy(): Promise<void> {
+    if (this.state.policyBusy) return
+    let policy: Record<string, number>
+    try {
+      policy = this.policyLimitsToRequest()
+    } catch (error) {
+      this.setState({
+        ...this.state,
+        policyError: error instanceof Error ? error.message : 'The policy limits are not usable.',
+      })
+      return
+    }
+    this.setState({ ...this.state, policyBusy: true, policyError: null, policyResult: null })
+    try {
+      const response = await fetch(POLICY_PREVIEW_PATH, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          policy,
+          // The session the operator is looking at is never a candidate.
+          excludeSessionIds: this.state.currentSessionId === null ? [] : [this.state.currentSessionId],
+        }),
+      })
+      const raw = await response.text()
+      let payload: PolicyPreviewPayload
+      try {
+        payload = JSON.parse(raw) as PolicyPreviewPayload
+      } catch {
+        throw new Error(`The host returned an unreadable response (HTTP ${response.status}).`)
+      }
+      if (!response.ok || payload.ok !== true) {
+        throw new Error(typeof payload.error === 'string'
+          ? payload.error
+          : `The policy preview failed (HTTP ${response.status}).`)
+      }
+      const selected = Array.isArray(payload.selected) ? payload.selected : []
+      this.setState({
+        ...this.state,
+        policyBusy: false,
+        policyPreview: {
+          selectedCount: typeof payload.selectedCount === 'number' ? payload.selectedCount : selected.length,
+          totalSelected: typeof payload.totalSelected === 'number' ? payload.totalSelected : selected.length,
+          totalSessions: typeof payload.totalSessions === 'number' ? payload.totalSessions : 0,
+          bytesToFree: typeof payload.bytesToFree === 'number' ? payload.bytesToFree : null,
+          selectedIds: selected.map(item => item.id).filter((id): id is string => typeof id === 'string'),
+          blocked: selected
+            .filter(item => typeof item.blockedReason === 'string' && item.blockedReason.length > 0)
+            .map(item => ({ id: item.id ?? '', reason: item.blockedReason ?? '' })),
+          truncated: payload.truncated === true,
+        },
+      })
+    } catch (error) {
+      this.setState({
+        ...this.state,
+        policyBusy: false,
+        policyPreview: null,
+        policyError: error instanceof Error ? error.message : 'The policy preview failed.',
+      })
+    }
+  }
+
+  /**
+   * Run the policy over exactly the sessions the preview named.
+   *
+   * The ids are sent, not the policy, so the run removes what the operator was
+   * shown. The host re-reads its own state before removing anything, so a
+   * session that became live in between is reported instead of deleted.
+   */
+  async applyPolicy(): Promise<void> {
+    if (this.state.policyBusy) return
+    const preview = this.state.policyPreview
+    if (preview === null || preview.selectedIds.length === 0) return
+    this.setState({ ...this.state, policyBusy: true, policyError: null })
+    try {
+      const response = await fetch(POLICY_APPLY_PATH, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ sessionIds: preview.selectedIds, confirm: true }),
+      })
+      const raw = await response.text()
+      let payload: PolicyApplyPayload
+      try {
+        payload = JSON.parse(raw) as PolicyApplyPayload
+      } catch {
+        throw new Error(`The host returned an unreadable response (HTTP ${response.status}).`)
+      }
+      // A run that skipped or failed some sessions still answers with its
+      // report, so the operator is told what happened instead of a flat error.
+      if (!Array.isArray(payload.results)) {
+        throw new Error(typeof payload.error === 'string'
+          ? payload.error
+          : `The policy run failed (HTTP ${response.status}).`)
+      }
+      try { await this.refreshList() } catch { /* host events may still update the list */ }
+      this.setState({
+        ...this.state,
+        policyBusy: false,
+        policyPreview: null,
+        policyAcknowledged: false,
+        policyResult: {
+          succeeded: typeof payload.succeeded === 'number' ? payload.succeeded : 0,
+          failed: typeof payload.failed === 'number' ? payload.failed : 0,
+          blocked: typeof payload.blocked === 'number' ? payload.blocked : 0,
+          bytesFreed: typeof payload.bytesFreed === 'number' ? payload.bytesFreed : null,
+        },
+      })
+    } catch (error) {
+      this.setState({
+        ...this.state,
+        policyBusy: false,
+        policyError: error instanceof Error ? error.message : 'The policy run failed.',
+      })
+    }
+  }
+
+  /**
+   * The limits as the host expects them.
+   *
+   * The size limit is typed in megabytes and sent in bytes, and a policy with
+   * no limit at all is refused here rather than sent: the host would answer
+   * 400, but the operator is better served by a sentence in their own language.
+   */
+  private policyLimitsToRequest(): Record<string, number> {
+    const policy: Record<string, number> = {}
+    const age = parseLimit(this.state.policyLimits.maxAgeDays, 'The age limit')
+    if (age !== undefined) policy.maxAgeDays = age
+    const count = parseLimit(this.state.policyLimits.maxCount, 'The session count limit')
+    if (count !== undefined) policy.maxCount = count
+    const megabytes = parseLimit(this.state.policyLimits.maxTotalBytes, 'The size limit')
+    if (megabytes !== undefined) policy.maxTotalBytes = Math.round(megabytes * BYTES_PER_MEGABYTE)
+    if (Object.keys(policy).length === 0) {
+      throw new Error('Set at least one limit before previewing the policy.')
+    }
+    return policy
+  }
+
+  /**
    * Ask the host what the pending deletion would remove.
    *
    * The preview is advisory: it only adds numbers to the dialog, so a failed
    * read leaves the delete path exactly as it was. An answer that arrives after
    * its dialog closed is dropped instead of reviving a closed dialog.
    */
-  private async loadImpact(ids: readonly SessionId[], token: number): Promise<void> {
-    try {
+  private async loadImpact(ids: readonly SessionId[], token: number): Promise<void> {    try {
       const response = await fetch(PREVIEW_PATH, {
         method: 'POST',
         headers: { 'content-type': 'application/json', accept: 'application/json' },

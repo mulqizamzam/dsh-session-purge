@@ -12,6 +12,17 @@ This package intentionally does not delete files by constructing a path or by ca
 
 Measured host APIs the adapter actually calls (DSH `0.2.0-rc.2` source, 2026-10-10): `SessionStore.flush` takes the Session **object**, not the id, `SessionStore.detach` takes the **id** and settles once the live entry is gone, and `SessionPersistence` methods take an options object carrying `signal` — the adapter calls those real shapes. The id itself must travel **verbatim**: `sessionDir(root, cwd, id)` keys every artifact by `encodeSegment(id)`, and the host mints both forms (`<uuid>` and `session-<uuid>` — a live list held 153 of the first and 4066 of the second), so rewriting the prefix makes a real artifact look absent and turns deletion into a silent no-op answered `ok: true`. One adapter detail that is deliberate: `logIsAbsent` verifies absence through `stat()` (undefined means absent) instead of trusting the `delete()` postcondition.
 
+### Read-only capabilities (impact preview and retention policy)
+
+Deletion needs none of these; the two read-only surfaces do. A host without them keeps the delete route working and answers HTTP 501 on the preview routes.
+
+| Capability | Required semantics | Used by |
+|---|---|---|
+| `sessionPersistence.stat(id)` | Resolve the stored-session snapshot, or `undefined` once the artifact is gone. The snapshot carries `header.createdAt` and, on the JSONL backend, the physical `sizeBytes`. | `POST /api/session-purge/preview`, `POST /api/session-purge/policy/apply` |
+| `sessionPersistence.list(options?)` | Resolve one snapshot per stored session, in no promised order. The JSONL backend populates `sizeBytes` for materialized artifacts; a session that was created but not yet materialized has none. | `POST /api/session-purge/policy/preview` |
+
+Both are part of the published `SessionPersistence` contract on this host (`packages/session/session-persistence/src/index.ts`), so no new host API is needed for the retention policy.
+
 ## Status in this checkout (2026-10-10)
 
 | Capability | Status |

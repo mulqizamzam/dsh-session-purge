@@ -3,6 +3,14 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { purgeSession, purgeSessions, type PurgeResult } from './purge-core.ts'
 import { previewSessions } from './preview-core.ts'
 import {
+  MAX_POLICY_SESSIONS,
+  planPolicyApply,
+  previewPolicy,
+  validatePolicy,
+  type RetentionPolicy,
+} from './policy-core.ts'
+import {
+  createPolicyAdapter,
   createPreviewAdapter,
   createRuntimeAdapter,
   publicErrorMessage,
@@ -14,6 +22,8 @@ export const inject = ['tools', 'connection']
 
 const DELETE_PATH = '/api/session-purge/delete'
 const PREVIEW_PATH = '/api/session-purge/preview'
+const POLICY_PREVIEW_PATH = '/api/session-purge/policy/preview'
+const POLICY_APPLY_PATH = '/api/session-purge/policy/apply'
 
 /**
  * Upper bound on one batch request. The client only ever sends ids it listed
@@ -168,31 +178,6 @@ function batchStatus(results: readonly PurgeResult[]): number {
 }
 
 /**
- * Tell the host's Session list that this id is gone.
- *
- * The session-controller converts `session/disposed` into the
- * `api-session/removed` wire event, which is what makes a Client drop a row
- * (`packages/api/session-controller/src/index.ts` emits it from that listener;
- * `packages/api/session-controller/src/client/index.ts` subscribes to it and the
- * manager records a `remove` mutation for the row). A session deleted straight
- * from the sidebar is cold: the store never entered it, so no `session/disposed`
- * edge exists and that chain never runs. The Client therefore kept the row, and
- * with the workspace membership this purge releases the row moved to the
- * "Ungrouped" group instead of disappearing.
- *
- * The event name is a string contract rather than a typed one: its Context event
- * map entry is declared by the session-controller package, which this plugin
- * does not depend on. The controller still owns the policy — a subagent row is
- * flagged rather than removed — so this reports only the fact of the deletion.
- * @param ctx - plugin context, whose scope dispatches to the host's listeners.
- * @param id - the canonical session id whose log was deleted.
- */
-function announceRemoval(ctx: Context, id: string): void {
-  const emitter = ctx as Context & { readonly emit: (event: string, ...args: unknown[]) => void }
-  emitter.emit('api-session/removed', id)
-}
-
-/**
  * Drop the `sessionPersistence.list` read cache so the next list rescan sees the
  * deletion. `dsh-session-readcache` memoizes that directory scan — the very call
  * behind `session.list` — and invalidates the memo only on `session/disposed`,
@@ -223,6 +208,40 @@ async function purgeSessionListCache(ctx: Context): Promise<void> {
   }
 }
 
+/**
+ * Report one removal to the host and drop the session-list read cache.
+ *
+ * The session-controller converts `session/disposed` into the
+ * `api-session/removed` wire event, which is what makes a Client drop a row
+ * (`packages/api/session-controller/src/index.ts` emits it from that listener;
+ * `packages/api/session-controller/src/client/index.ts` subscribes to it and the
+ * manager records a `remove` mutation for the row). A session deleted straight
+ * from the sidebar is cold: the store never entered it, so no `session/disposed`
+ * edge exists and that chain never runs. The Client therefore kept the row, and
+ * with the workspace membership this purge releases the row moved to the
+ * "Ungrouped" group instead of disappearing.
+ *
+ * The event name is a string contract rather than a typed one: its Context event
+ * map entry is declared by the session-controller package, which this plugin
+ * does not depend on. The controller still owns the policy — a subagent row is
+ * flagged rather than removed — so this reports only the fact of the deletion.
+ *
+ * Both halves are reporting side-channels: a listener that throws must not
+ * rewrite a completed deletion into a reported failure, and the cache may only
+ * be dropped once the fact exists.
+ * @param ctx - plugin context, whose scope dispatches to the host's listeners.
+ * @param id - the canonical session id whose log was deleted.
+ */
+async function announceRemoval(ctx: Context, id: string): Promise<void> {
+  try {
+    const emitter = ctx as Context & { readonly emit: (event: string, ...args: unknown[]) => void }
+    emitter.emit('api-session/removed', id)
+  } catch (error) {
+    logUnexpected(ctx, error, 'announce')
+  }
+  await purgeSessionListCache(ctx)
+}
+
 export function apply(ctx: Context): void {
   const resolved = new Map<string, object>()
   for (const name of OPTIONAL_SERVICES) {
@@ -234,6 +253,7 @@ export function apply(ctx: Context): void {
   const resolve: ServiceResolver = name => resolved.get(name) as ReturnType<ServiceResolver>
   const runtime = createRuntimeAdapter(resolve)
   const preview = createPreviewAdapter(resolve)
+  const policy = createPolicyAdapter(resolve)
 
   ctx.tools.register(defineTool({
     name: 'session_purge',
@@ -312,14 +332,7 @@ export function apply(ctx: Context): void {
               // Report each removal and drop the list read cache the moment the
               // fact exists, so a failure or abort later in the batch cannot
               // swallow the announcements of sessions that were really deleted.
-              // Both are reporting side-channels: a listener that throws must
-              // not rewrite a completed deletion into a reported failure.
-              try {
-                announceRemoval(ctx, id)
-              } catch (error) {
-                logUnexpected(ctx, error, 'announce')
-              }
-              await purgeSessionListCache(ctx)
+              await announceRemoval(ctx, id)
             },
           )
           return json(batch, batchStatus(batch.results))
@@ -340,12 +353,11 @@ export function apply(ctx: Context): void {
         // rescan a session that still exists. Failure here is contained — the
         // deleted log is the fact the response reports.
         if (result.log) {
-          // Both are downstream of a deletion that actually happened, so neither
-          // can turn a completed deletion into a reported failure: the Client's
-          // row is dropped through the wire event, and the memoized list scan is
-          // dropped so the next full refresh cannot resurrect it.
-          announceRemoval(ctx, result.id)
-          await purgeSessionListCache(ctx)
+          // Downstream of a deletion that actually happened, so neither half
+          // can turn a completed deletion into a reported failure: the
+          // Client's row is dropped through the wire event, and the memoized
+          // list scan is dropped so the next full refresh cannot resurrect it.
+          await announceRemoval(ctx, result.id)
         }
         return json(result, resultStatus(result))
       } catch (error) {
@@ -391,4 +403,139 @@ export function apply(ctx: Context): void {
       }
     },
   })
+
+  // The policy preview: what a retention policy would remove, asked before
+  // the operator commits to it. Like the impact preview it never calls a
+  // removal primitive, so it needs no `confirm`.
+  connectionOf(ctx).fetch.register({
+    path: POLICY_PREVIEW_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async request => {
+      if (request.method !== 'POST') return json({ ok: false, error: 'method-not-allowed' }, 405)
+      const refused = originFence(request)
+      if (refused) return refused
+      const parsed = await jsonBody(request)
+      if ('response' in parsed) return parsed.response
+      const input = parsed.body as { policy?: unknown; excludeSessionIds?: unknown }
+      let limits: RetentionPolicy
+      try {
+        limits = validatePolicy(input.policy)
+      } catch (error) {
+        return json({ ok: false, error: publicErrorMessage(error) }, 400)
+      }
+      try {
+        const report = await previewPolicy(policy, limits, Date.now(), stringIds(input.excludeSessionIds))
+        return json({ ok: true, ...report })
+      } catch (error) {
+        logUnexpected(ctx, error, 'policy-preview')
+        const message = publicErrorMessage(error)
+        return json({ ok: false, error: message }, message.includes('runtime-capability-missing') ? 501 : 500)
+      }
+    },
+  })
+
+  // The policy apply: run the purge pipeline over the sessions a policy
+  // selects. The ids may be sent explicitly (what the preview listed, so the
+  // dry run and the run name the same sessions) or left to the host, which
+  // then selects them again from the policy.
+  connectionOf(ctx).fetch.register({
+    path: POLICY_APPLY_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async request => {
+      if (request.method !== 'POST') return json({ ok: false, error: 'method-not-allowed' }, 405)
+      const refused = originFence(request)
+      if (refused) return refused
+      const parsed = await jsonBody(request)
+      if ('response' in parsed) return parsed.response
+      const input = parsed.body as {
+        policy?: unknown
+        sessionIds?: unknown
+        excludeSessionIds?: unknown
+        confirm?: unknown
+      }
+      // The destructive half of the policy: the same explicit consent the
+      // single-session delete asks for.
+      if (input.confirm !== true) {
+        return json({ ok: false, error: 'confirm-true-required' }, 400)
+      }
+      let ids: readonly string[]
+      try {
+        if (Array.isArray(input.sessionIds)) {
+          if (
+            input.sessionIds.length === 0
+            || input.sessionIds.length > MAX_POLICY_SESSIONS
+            || !input.sessionIds.every(id => typeof id === 'string')
+          ) {
+            return json({ ok: false, error: `sessionIds-must-be-1..${String(MAX_POLICY_SESSIONS)}-strings` }, 400)
+          }
+          ids = input.sessionIds as readonly string[]
+        } else {
+          const limits = validatePolicy(input.policy)
+          const report = await previewPolicy(policy, limits, Date.now(), stringIds(input.excludeSessionIds))
+          ids = report.selected.map(item => item.id)
+        }
+      } catch (error) {
+        logUnexpected(ctx, error, 'policy-apply-select')
+        const message = publicErrorMessage(error)
+        const status = message.includes('invalid-policy') ? 400 : message.includes('runtime-capability-missing') ? 501 : 500
+        return json({ ok: false, error: message }, status)
+      }
+
+      try {
+        // The host's state is read again here instead of trusting the preview:
+        // a session may have become live, or its log may have gone, between
+        // the two requests.
+        const plan = await planPolicyApply(preview, ids, Date.now())
+        const batch = await purgeSessions(
+          runtime,
+          plan.deletableIds,
+          request.signal,
+          (error, stage) => { logUnexpected(ctx, error, stage) },
+          async id => { await announceRemoval(ctx, id) },
+        )
+        const sizes = new Map(plan.impacts.map(item => [item.id, item.sizeBytes]))
+        const freed = batch.results
+          .filter(result => result.ok)
+          .map(result => sizes.get(result.id) ?? null)
+        const known = freed.filter((size): size is number => size !== null)
+        const response = {
+          ok: batch.ok && plan.blocked.length === 0,
+          total: ids.length,
+          succeeded: batch.succeeded,
+          failed: batch.failed,
+          blocked: plan.blocked.length,
+          bytesFreed: known.length === 0 ? null : known.reduce((sum, size) => sum + size, 0),
+          results: batch.results,
+          blockedResults: plan.blocked.map(item => ({ id: item.id, reason: item.blockedReason })),
+        }
+        return json(response, policyApplyStatus(batch.results, plan.blocked.length))
+      } catch (error) {
+        logUnexpected(ctx, error, 'policy-apply')
+        const message = publicErrorMessage(error)
+        return json({ ok: false, error: message }, message.includes('runtime-capability-missing') ? 501 : 500)
+      }
+    },
+  })
+}
+
+/** The ids a caller asked to leave alone; anything that is not a string is not an id. */
+function stringIds(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((id): id is string => typeof id === 'string')
+}
+
+/**
+ * HTTP status for a policy run.
+ *
+ * The severity order matches the delete route's: a host that cannot delete at
+ * all is a capability report (501), a session something still holds is a
+ * retryable conflict (409), and anything else is a genuine per-item failure
+ * (500). A run that skipped nothing and failed nothing is a success (200).
+ */
+function policyApplyStatus(results: readonly PurgeResult[], blocked: number): number {
+  const status = batchStatus(results)
+  if (status === 200 && blocked > 0) return 409
+  return status
 }
