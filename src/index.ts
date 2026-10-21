@@ -501,7 +501,11 @@ export function apply(ctx: Context): void {
           .map(result => sizes.get(result.id) ?? null)
         const known = freed.filter((size): size is number => size !== null)
         const response = {
-          ok: batch.ok && plan.blocked.length === 0,
+          // A run that removed nothing because the policy selected nothing is a
+          // successful no-op, not a failure: `batch.ok` is false for an empty
+          // batch, and a policy that keeps everything is exactly what the
+          // operator asked for.
+          ok: batch.failed === 0 && plan.blocked.length === 0,
           total: ids.length,
           succeeded: batch.succeeded,
           failed: batch.failed,

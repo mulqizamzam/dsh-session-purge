@@ -176,7 +176,9 @@ export class SessionPurgeController {
     // silently clear `busy`, and the in-flight completion would then close the
     // NEW dialog while that session's own purge is still running — two deletes
     // racing through one state slot. The request is ignored instead.
-    if (this.state.busy) return
+    // A policy run counts as a purge in flight: both mutate the same host
+    // state, and the cleanup contract says one batch at a time.
+    if (this.state.busy || this.state.policyBusy) return
     const token = this.nextToken++
     this.setState({
       ...this.state,
@@ -200,7 +202,7 @@ export class SessionPurgeController {
     // the keyboard can still reach the sidebar foot behind it, so the manager
     // must refuse to stack over an open confirmation — whether that dialog is
     // busy deleting or merely waiting for consent.
-    if (this.state.busy) return
+    if (this.state.busy || this.state.policyBusy) return
     if (this.state.target !== null || this.state.batch !== null) return
     // Selection survives a re-open (a refresh while picking must not lose
     // picks); the manager intersects it with the fresh rows before confirming.

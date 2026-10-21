@@ -345,6 +345,19 @@ describe('POST /api/session-purge/policy/apply', () => {
     expect(String(empty.payload.error)).toContain('sessionIds-must-be-1..500-strings')
   })
 
+  it('reports a policy that selects nothing as a successful no-op', async () => {
+    const { services, mutations } = policyCapableHost({ stored: THREE_SESSIONS })
+    const { routes } = await opened(services)
+    // Every stored session is inside a 3650-day limit, so nothing is selected.
+    const { status, payload } = await call(routes[3], { policy: { maxAgeDays: 3650 }, confirm: true }, SAME_ORIGIN)
+    expect(status).toBe(200)
+    expect(payload.ok).toBe(true)
+    expect(payload.total).toBe(0)
+    expect(payload.succeeded).toBe(0)
+    expect(payload.blocked).toBe(0)
+    expect(mutations).toEqual({})
+  })
+
   it('answers 501 when the host cannot report stored-session metadata', async () => {
     const { services } = policyCapableHost({ stored: THREE_SESSIONS, withoutStat: true })
     const { routes } = await opened(services)

@@ -380,6 +380,25 @@ function policyController(preview: unknown = policyPreviewPayload(), apply: unkn
 }
 
 describe('SessionPurgeController — retention policy', () => {
+  it('refuses to open a delete dialog while a policy run is in flight', async () => {
+    let settle: (response: Response) => void = () => {}
+    const { fetchMock } = stubFetch(() => new Promise<Response>(resolve => { settle = resolve }))
+    const controller = new SessionPurgeController(vi.fn(async () => {}))
+    controller.openPolicy()
+    controller.setPolicyLimit('maxAgeDays', '30')
+    const inFlight = controller.previewPolicy()
+    expect(controller.getSnapshot().policyBusy).toBe(true)
+    // A second destructive flow would race the policy run over the same host
+    // state, so the delete dialog stays closed.
+    controller.open(ID_A, 'alpha')
+    expect(controller.getSnapshot().target).toBeNull()
+    controller.openManager(rows)
+    expect(controller.getSnapshot().managerOpen).toBe(false)
+    settle(jsonResponse(policyPreviewPayload()))
+    await inFlight
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it('refuses to open the policy surface while a delete is in flight', async () => {
     const { controller, settle } = pendingController()
     controller.open(ID_A, 'alpha')

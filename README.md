@@ -465,12 +465,12 @@ src/
     controller.ts       # UI state: single + multi-select, impact preview, batch POST, retention policy, in-place list refresh
 test/
   purge-core.test.ts    # ordering, failure-path and batch tests (16 tests)
-  controller.test.ts    # client state machine tests (27 tests)
+  controller.test.ts    # client state machine tests (28 tests)
   api-route.test.ts     # route, origin gate, capability, model-tool refusal and batch tests (36 tests)
   client-ui.test.ts     # jsdom mount of the real components, real events (30 tests)
   preview.test.ts       # read-only preview route: impact, fences, isolation, and that it mutates nothing (19 tests)
   policy.test.ts        # policy validation and deterministic selection (30 tests)
-  policy-route.test.ts  # policy preview/apply routes: fences, selection, blocks, and that the preview mutates nothing (19 tests)
+  policy-route.test.ts  # policy preview/apply routes: fences, selection, blocks, and that the preview mutates nothing (20 tests)
 integration/
   README.md             # host capabilities required for real deletion
 cordis.patch.yml        # how the profile mounts this package (one insert row)
@@ -561,15 +561,15 @@ What success looks like (observed):
 
 ```text
  ✓ test/purge-core.test.ts (16 tests) 43ms
- ✓ test/controller.test.ts (27 tests) 57ms
+ ✓ test/controller.test.ts (28 tests) 39ms
  ✓ test/preview.test.ts (19 tests) 379ms
- ✓ test/policy-route.test.ts (19 tests) 214ms
+ ✓ test/policy-route.test.ts (20 tests) 187ms
  ✓ test/policy.test.ts (30 tests) 34ms
  ✓ test/api-route.test.ts (36 tests) 342ms
  ✓ test/client-ui.test.ts (30 tests) 535ms
 
  Test Files  7 passed (7)
-      Tests  177 passed (177)
+      Tests  179 passed (179)
 ```
 
 Exit code 0 on pass (observed). A failing assertion is reported per test by vitest
@@ -767,7 +767,7 @@ cannot prove compatibility, so check your runtime yourself with
 - [ ] You cloned this repository and `cd` into it
 - [ ] `npm install` completed against a registry that publishes `@deepseek-ai/*`
 - [ ] `npm run type-check` exited 0 with no output
-- [ ] `npm test` reported `177 passed (177)`
+- [ ] `npm test` reported `179 passed (179)`
 - [ ] `npm run build` wrote `lib/index.js` and `lib/client.js`
 - [ ] `dsh plugin --profile <name> add link:.` completed
 - [ ] `dsh --profile <name> --dump-config` shows the `session-purge` row
