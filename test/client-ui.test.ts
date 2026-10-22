@@ -766,6 +766,42 @@ describe('the retention policy overlay', () => {
     expect(container.textContent).not.toContain('(—)')
   })
 
+  it('names the selected sessions the host would refuse to remove right now', async () => {
+    const harness = freshClient()
+    // One of the selected sessions is held by a live agent the host cannot
+    // stop: it is in the list, and it cannot be removed.
+    const selected = [
+      { id: ID_A, exists: true, createdAt: Date.now(), ageDays: 40, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+      { id: ID_B, exists: true, createdAt: Date.now(), ageDays: 35, sizeBytes: 1024, liveAgent: 'live', attached: false, deletable: false, blockedReason: 'session-live' },
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) => {
+      if (String(url).includes('/policy/preview')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          totalSessions: 12,
+          selectedCount: 2,
+          totalSelected: 2,
+          keptCount: 10,
+          bytesToFree: 2048,
+          bytesThisRun: 2048,
+          truncated: false,
+          selected,
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    // The operator is told how many of the selected sessions cannot go.
+    expect(container.textContent).toContain('1 of the selected sessions cannot be removed right now')
+    // The reason is a sentence, never the machine code.
+    expect(container.textContent).toContain('a live agent still holds it')
+    expect(container.textContent).not.toContain('session-live')
+  })
+
   it('drops the preview when a limit changes, so the run cannot act on a stale selection', async () => {
     const harness = freshClient()
     vi.stubGlobal('fetch', policyFetch())
