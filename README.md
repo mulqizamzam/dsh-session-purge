@@ -182,7 +182,10 @@ It is read-only: it calls no removal primitive, and it needs no `confirm`.
   **wherever it sits** — its size cannot be shown to break the budget, and this
   tool only removes what it can show is over the limit. (The host's contract
   makes `sizeBytes` optional, and the JSONL backend reports none for a session
-  that was created but not yet materialized.)
+  that was created but not yet materialized. Measured on this host on
+  2026-10-22: all 5436 stored sessions reported one, so the carve-out never
+  fired there — but the field is optional by contract, and another backend may
+  omit it.)
 - The budgets are evaluated over *all* stored sessions, including the excluded
   ones: an excluded session still occupies a count slot and still holds bytes.
   Excluding it may only keep it, never move the cut.
@@ -630,6 +633,9 @@ loads it.
 | The `Select sessions` button never appears, while `Delete session` does | The footer entry renders through the `sidebar.footer.action` seat and crashed on `useSessions()` — this host's selector hook throws when called without a selector (the no-argument overload exists in the published type but not at runtime). Measured live; the shipped `CordisPanel` footer occupant always passes one. | `src/client/index.tsx` calls `useSessions(state => state)` (identity selector) | Already fixed; if it recurs, pass a selector |
 | The 🗑 button never appears | Profile not restarted since install, client bundle missing, or a profile without a web surface | `dsh --profile <name> --dump-config` for the row, `ls lib/client.js` for the bundle | Build, restart; the buttons only exist in the `web` platform half |
 | `require("...") missed the module table` in the browser console | The client bundle asked for something outside the platform seed words | Compare `CLIENT_SEED_EXTERNALS` in `tsdown.config.ts` with `getStaticModules()` in your host's `packages/client/web/src/seed.ts` | Keep the two lists identical, rebuild |
+| `curl` to any `/api/session-purge/...` route answers `401 unauthorized` (plain text) | The host requires the browser's `dsh-auth-*` cookie, which `curl` does not carry | Call the route from the page (the browser's `fetch` carries it), or copy the cookie out of the browser |
+| `curl` to any `/api/session-purge/...` route answers `403 forbidden` (plain text) | The host's own origin trust fence answered before the plugin's, because the request carried a foreign `Origin` | Send the request without an `Origin` header, or with the page's own origin |
+| `404 not found` (plain text) from a route that exists | The host's router only matches the method it registered, so a `GET` on a POST-only route never reaches the plugin's `405` branch | Use `POST` |
 | Dialog shows `runtime-capability-missing: ...` | The host does not expose the required services | Read the message: it names the service and method | Expected on stock hosts. Implement `integration/README.md`, or accept that deletion stays disabled |
 | Dialog shows `unexpected-error: operation failed; inspect host logs for details.` at HTTP 500 | A plain (non-`SessionPurgeError`) exception reached the sanitizer; the real cause is one line above in the host log, tagged `session-purge: unexpected failure at <stage>` | The host log for the `session-purge: unexpected failure` line | The label is honest only with the log line: the route logs the raw error before answering. On a correctly wired host this string must not appear for the plain "host has no delete primitive" case — that answers `runtime-capability-missing` instead |
 | Response `409` with `session-live` / `session-still-live` | A live agent exists but the host exposes no safe stop capability, or the registry still lists it after `stop()` | Message text from `src/runtime-adapter.ts` | Stop the session first, or add the host-owned disposal bridge |
@@ -712,6 +718,14 @@ Notes:
   `test/api-route.test.ts` locks this: same-origin admitted end to end, and
   foreign-origin, wrong-port, unparsable-origin, and missing-Host all rejected
   with nothing deleted.
+- **On this host the host's own boundary answers first — measured, 2026-10-22.**
+  A request with a foreign `Origin` is answered by the host's trust fence with
+  `403 forbidden` in `text/plain`, before the plugin's own JSON fence can run;
+  a request without the browser's `dsh-auth-*` cookie is answered with
+  `401 unauthorized`; and a method the host does not have for the path is
+  answered with `404 not found` instead of the plugin's `405`. The plugin's
+  fences stay in place as the fallback for a host that does not apply its own,
+  but on this host they are the second line, not the first.
 - **Never replace the capability checks with direct file deletion.** Persistence can
   hold in-memory indexes and recreate a removed artifact; see `integration/README.md`.
 - **The preview route is a metadata-read surface.** It needs no `confirm` because it
