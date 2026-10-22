@@ -106,10 +106,17 @@ Response:
   first two are mutually exclusive by construction: without an agent registry
   the live state is `unknown`, and that check comes first, so
   `agent-registry-unavailable` always wins and `session-live` needs a working
-  registry to be reachable at all. A session with no stored log is not a
+  registry to be reachable at all. The four codes therefore partition by host
+  capability: no registry -> `agent-registry-unavailable` (and the delete route
+  answers 501 on that host), a registry that cannot drain a live agent ->
+  `session-live`, a malformed id -> `invalid-session-id`, a persistence layer
+  that throws on a stored artifact -> `stat-failed`. A session with no stored log is not a
   blocker: `exists: false` says it, and deleting an absent log is a successful
   no-op. A malformed or unreadable id is reported per item instead of failing
-  the whole request, so one unusable id cannot hide the others.
+  the whole request, so one unusable id cannot hide the others. Verified live
+  on 2026-10-22: a batch of two real sessions, two absent ids and one malformed
+  id answered 200 with every item described, the malformed one isolated as
+  `invalid-session-id`.
 - The panel is advisory. When the preview cannot be read, the dialog still
   deletes — only the consent checkbox gates the destructive button. After a
   partial batch failure the panel is read again for the pending remainder, so it
