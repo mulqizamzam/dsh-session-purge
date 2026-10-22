@@ -650,6 +650,48 @@ describe('the retention policy overlay', () => {
     expect(container.textContent).toContain('1.0 KB')
   })
 
+  it('names the whole flagged count in the headline, not only the run\'s share', async () => {
+    const harness = freshClient()
+    // A policy that flags more sessions than one run may remove.
+    const selected = Array.from({ length: 3 }, (_unused, index) => ({
+      id: `${String(index).padStart(8, '0')}-0000-4000-8000-000000000000`,
+      exists: true,
+      createdAt: Date.now(),
+      ageDays: 40,
+      sizeBytes: 1024,
+      liveAgent: 'idle',
+      attached: false,
+      deletable: true,
+      blockedReason: '',
+    }))
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) => {
+      if (String(url).includes('/policy/preview')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          totalSessions: 5436,
+          selectedCount: 3,
+          totalSelected: 5423,
+          keptCount: 13,
+          bytesToFree: 195100000,
+          bytesThisRun: 3072,
+          truncated: true,
+          selected,
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '1') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    // The headline names every flagged session, not only the ones this run lists.
+    expect(container.textContent).toContain('5423 of 5436 sessions selected')
+    expect(container.textContent).toContain('186.1 MB to free')
+    // And the run's own share is spelled out.
+    expect(container.textContent).toContain('this run removes the first 3')
+  })
+
   it('drops the preview when a limit changes, so the run cannot act on a stale selection', async () => {
     const harness = freshClient()
     vi.stubGlobal('fetch', policyFetch())

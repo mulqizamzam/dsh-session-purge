@@ -151,6 +151,7 @@ It is read-only: it calls no removal primitive, and it needs no `confirm`.
   "totalSelected": 12,
   "keptCount": 116,
   "bytesToFree": 4821304,
+  "bytesThisRun": 4821304,
   "bytesKept": 91200432,
   "selected": [
     {
@@ -188,6 +189,11 @@ It is read-only: it calls no removal primitive, and it needs no `confirm`.
 - `selectedCount` is what one run removes (at most 500 sessions); `totalSelected`
   is what the policy flags in total. When they differ, `truncated` is `true` and
   the operator runs it again for the rest.
+- `bytesToFree` is what the **policy** targets and `bytesThisRun` is what the
+  listed sessions hold — the part one run actually removes. The two differ only
+  when the run is capped, and the surface shows both, so a headline of
+  "5423 of 5436 sessions · 195.1 MB" is the real blast radius rather than the
+  500 sessions one run happens to list.
 - A host that cannot list its stored sessions answers HTTP 501 with
   `runtime-capability-missing`. The delete and preview routes are unaffected.
 
@@ -251,7 +257,8 @@ The sidebar foot carries a second entry next to the manual selection button:
 🧹 **Retention**. It opens the policy surface with the three limits, a
 **Preview policy** button and an **Apply policy** button. The preview lists the
 sessions it would remove — id, age and size — so the operator consents to
-*these* sessions, not to a number.
+*these* sessions, not to a number. The headline names every session the policy
+flags, and the line below it says how many of them this one run removes.
 
 The session the operator is currently viewing is excluded from every policy
 request: it is left out of the preview, it travels with the run as

@@ -62,7 +62,10 @@ export interface PolicyPreviewSummary {
   /** How many sessions the policy flags in total, before the run cap. */
   readonly totalSelected: number
   readonly totalSessions: number
+  /** The known bytes the policy targets. */
   readonly bytesToFree: number | null
+  /** The known bytes the sessions this run lists hold. */
+  readonly bytesThisRun: number | null
   readonly selected: readonly PolicySessionRow[]
   readonly blocked: readonly { readonly id: string; readonly reason: string }[]
   readonly truncated: boolean
@@ -115,6 +118,7 @@ interface PolicyPreviewPayload {
   selectedCount?: number
   totalSelected?: number
   bytesToFree?: number | null
+  bytesThisRun?: number | null
   truncated?: boolean
   selected?: { id?: string; ageDays?: number; sizeBytes?: number | null; blockedReason?: string }[]
 }
@@ -392,6 +396,7 @@ export class SessionPurgeController {
           totalSelected: typeof payload.totalSelected === 'number' ? payload.totalSelected : selected.length,
           totalSessions: typeof payload.totalSessions === 'number' ? payload.totalSessions : 0,
           bytesToFree: typeof payload.bytesToFree === 'number' ? payload.bytesToFree : null,
+          bytesThisRun: typeof payload.bytesThisRun === 'number' ? payload.bytesThisRun : null,
           selected: selected.map(item => ({
             id: typeof item.id === 'string' ? item.id : '',
             ageDays: typeof item.ageDays === 'number' ? item.ageDays : null,

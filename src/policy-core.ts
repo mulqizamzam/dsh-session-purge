@@ -75,10 +75,17 @@ export interface PolicyPreviewReport {
   readonly totalSelected: number
   /** How many sessions are kept. */
   readonly keptCount: number
-  /** The known bytes this run frees, or null when no size is known. */
+  /** The known bytes the policy targets, or null when no size is known. */
   readonly bytesToFree: number | null
   /** The known bytes the kept sessions hold, or null when no size is known. */
   readonly bytesKept: number | null
+  /**
+   * The known bytes the sessions this run lists hold.
+   *
+   * `bytesToFree` is what the whole policy targets; this is the part of it one
+   * run actually removes, so a report can name both.
+   */
+  readonly bytesThisRun: number | null
   /** The impact of each session this run removes. */
   readonly selected: readonly SessionImpact[]
   /** The ids the caller asked to leave alone. */
@@ -325,8 +332,14 @@ export async function previewPolicy(
     selectedCount: listed.length,
     totalSelected: selection.selected.length,
     keptCount: candidates.length - selection.selected.length,
-    bytesToFree: sumKnown(listed),
+    // What the POLICY targets, not what one run lists: a store where the
+    // policy flags more sessions than one run may remove must still say so in
+    // the headline, or the operator consents to a fraction of the real blast
+    // radius.
+    bytesToFree: selection.bytesToFree,
     bytesKept: selection.bytesKept,
+    // What THIS run removes.
+    bytesThisRun: sumKnown(listed),
     selected,
     excludedIds: [...excluded],
     truncated: selection.selected.length > listed.length,

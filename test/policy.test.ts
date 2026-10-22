@@ -322,6 +322,10 @@ describe('previewPolicy', () => {
     expect(report.selectedCount).toBe(MAX_POLICY_SESSIONS)
     expect(report.totalSelected).toBe(MAX_POLICY_SESSIONS + 25)
     expect(report.truncated).toBe(true)
+    // The headline numbers must be the POLICY's, not the run's share: the
+    // operator has to see the whole blast radius, not the first slice of it.
+    expect(report.bytesToFree).toBe((MAX_POLICY_SESSIONS + 25) * 10)
+    expect(report.bytesThisRun).toBe(MAX_POLICY_SESSIONS * 10)
   })
 })
 

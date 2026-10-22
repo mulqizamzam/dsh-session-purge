@@ -75,7 +75,7 @@ const en: LocaleDictOf<typeof NS> = {
   policyApplyAction: 'Apply policy',
   policyPreviewTitle: 'What the policy would remove',
   policySummary: '{count} of {total} sessions selected · {size} to free',
-  policyTruncated: 'The policy flags {count} sessions; only the first {shown} are listed. Run it again for the rest.',
+  policyTruncated: 'The policy flags {count} sessions; this run removes the first {shown} ({size}). Apply it, then run it again for the rest.',
   policyBlocked: '{count} sessions cannot be removed right now.',
   policyNothing: 'Nothing to remove: every stored session is inside the limits.',
   policyConsent: 'I understand this permanently removes the selected sessions.',
@@ -126,7 +126,7 @@ const zh: LocaleDictOf<typeof NS> = {
   policyApplyAction: '应用策略',
   policyPreviewTitle: '策略将移除的内容',
   policySummary: '已选择 {total} 个会话中的 {count} 个 · 可释放 {size}',
-  policyTruncated: '策略标记了 {count} 个会话，仅列出前 {shown} 个。请再次运行以处理其余部分。',
+  policyTruncated: '策略标记了 {count} 个会话；本次运行删除前 {shown} 个（{size}）。请先应用，再运行一次处理其余部分。',
   policyBlocked: '当前有 {count} 个会话无法移除。',
   policyNothing: '无需移除：所有已存储会话都在限制范围内。',
   policyConsent: '我理解此操作将永久移除所选会话。',
@@ -497,13 +497,13 @@ function PolicyOverlay({ controller, t }: OverlayProps) {
         {preview !== null && (
           <div style={{ margin: '14px 0', padding: '10px 12px', borderRadius: 10, background: 'var(--dsh-surface, rgba(0,0,0,0.05))' }}>
             <div style={{ fontSize: 12, opacity: 0.7 }}>{t('policyPreviewTitle')}</div>
-            {preview.selectedCount === 0
+            {preview.totalSelected === 0
               ? <div style={{ fontSize: 13 }}>{t('policyNothing')}</div>
               : (
                 <>
                   <div style={{ fontSize: 13 }}>
                     {t('policySummary', {
-                      count: preview.selectedCount,
+                      count: preview.totalSelected,
                       total: preview.totalSessions,
                       size: formatBytes(preview.bytesToFree),
                     })}
@@ -541,7 +541,11 @@ function PolicyOverlay({ controller, t }: OverlayProps) {
                   )}
                   {preview.truncated && (
                     <div style={{ fontSize: 12, opacity: 0.7 }}>
-                      {t('policyTruncated', { count: preview.totalSelected, shown: preview.selectedCount })}
+                      {t('policyTruncated', {
+                        count: preview.totalSelected,
+                        shown: preview.selectedCount,
+                        size: formatBytes(preview.bytesThisRun),
+                      })}
                     </div>
                   )}
                   {preview.blocked.length > 0 && (
