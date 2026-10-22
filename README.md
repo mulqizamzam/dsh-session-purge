@@ -254,6 +254,14 @@ a session that became live in between is reported instead of deleted.
   known-sized session, which the host accepts for API callers but which is not
   something to type by accident.
 
+### How long a run takes
+
+On the measured profile (5448 stored sessions, 2.52 GB) a policy preview took
+seconds cold and about 200 ms warm, and a single-session apply took 8.9 s.
+The surface shows a `Working…` state and disables the limit fields while a
+request is in flight, so a slow run looks busy rather than hung — but it is a
+sequential run, and one run may remove up to 500 sessions.
+
 ### The retention surface in the client
 
 The sidebar foot carries a second entry next to the manual selection button:

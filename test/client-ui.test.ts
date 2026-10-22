@@ -728,6 +728,42 @@ describe('the retention policy overlay', () => {
     expect(container.textContent).toContain('this run removes the first 2')
     expect(container.textContent).not.toContain('(—)')
     expect(container.textContent).not.toContain('( )')
+    // The headline keeps the figure the host DID send.
+    expect(container.textContent).toContain('9 of 12 sessions selected')
+    expect(container.textContent).toContain('to free')
+  })
+
+  it('omits the headline\'s byte figure when the host sends none at all', async () => {
+    const harness = freshClient()
+    // A host that knows neither the policy's target bytes nor the run's share.
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) => {
+      if (String(url).includes('/policy/preview')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          totalSessions: 12,
+          selectedCount: 2,
+          totalSelected: 9,
+          keptCount: 3,
+          truncated: true,
+          selected: [
+            { id: ID_A, exists: true, createdAt: Date.now(), ageDays: 40, sizeBytes: null, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+            { id: ID_B, exists: true, createdAt: Date.now(), ageDays: 35, sizeBytes: null, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+          ],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    // No byte claim the host did not make, in either line. The rows keep the
+    // surface's own "size unknown" marker - that one is load-bearing.
+    expect(container.textContent).toContain('9 of 12 sessions selected')
+    expect(container.textContent).not.toContain('to free')
+    expect(container.textContent).not.toContain('— to free')
+    expect(container.textContent).not.toContain('(—)')
   })
 
   it('drops the preview when a limit changes, so the run cannot act on a stale selection', async () => {

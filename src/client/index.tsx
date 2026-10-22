@@ -23,7 +23,7 @@ type LocaleKey =
   | 'impactReasonLive' | 'impactReasonInvalid' | 'impactReasonRegistry' | 'impactReasonStat'
   | 'policyLabel' | 'policyTitle' | 'policyHint' | 'policyAgeLabel' | 'policyCountLabel' | 'policySizeLabel'
   | 'policyPreviewAction' | 'policyApplyAction' | 'policyPreviewTitle' | 'policySummary' | 'policyTruncated'
-  | 'policyTruncatedNoSize'
+  | 'policySummaryNoSize' | 'policyTruncatedNoSize'
   | 'policyBlocked' | 'policyNothing' | 'policyConsent' | 'policyResult' | 'policyWorking'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -76,6 +76,7 @@ const en: LocaleDictOf<typeof NS> = {
   policyApplyAction: 'Apply policy',
   policyPreviewTitle: 'What the policy would remove',
   policySummary: '{count} of {total} sessions selected · {size} to free',
+  policySummaryNoSize: '{count} of {total} sessions selected',
   policyTruncated: 'The policy flags {count} sessions; this run removes the first {shown} ({size}). Apply it, then run it again for the rest.',
   policyTruncatedNoSize: 'The policy flags {count} sessions; this run removes the first {shown}. Apply it, then run it again for the rest.',
   policyBlocked: '{count} sessions cannot be removed right now.',
@@ -128,6 +129,7 @@ const zh: LocaleDictOf<typeof NS> = {
   policyApplyAction: '应用策略',
   policyPreviewTitle: '策略将移除的内容',
   policySummary: '已选择 {total} 个会话中的 {count} 个 · 可释放 {size}',
+  policySummaryNoSize: '已选择 {total} 个会话中的 {count} 个',
   policyTruncated: '策略标记了 {count} 个会话；本次运行删除前 {shown} 个（{size}）。请先应用，再运行一次处理其余部分。',
   policyTruncatedNoSize: '策略标记了 {count} 个会话；本次运行删除前 {shown} 个。请先应用，再运行一次处理其余部分。',
   policyBlocked: '当前有 {count} 个会话无法移除。',
@@ -509,11 +511,16 @@ function PolicyOverlay({ controller, t }: OverlayProps) {
               : (
                 <>
                   <div style={{ fontSize: 13 }}>
-                    {t('policySummary', {
-                      count: preview.totalSelected,
-                      total: preview.totalSessions,
-                      size: formatBytes(preview.bytesToFree),
-                    })}
+                    {preview.bytesToFree === null
+                      ? t('policySummaryNoSize', {
+                        count: preview.totalSelected,
+                        total: preview.totalSessions,
+                      })
+                      : t('policySummary', {
+                        count: preview.totalSelected,
+                        total: preview.totalSessions,
+                        size: formatBytes(preview.bytesToFree),
+                      })}
                   </div>
                   {/* The sessions themselves, not only their number: the
                       operator consents to these ids, so it must be able to see
