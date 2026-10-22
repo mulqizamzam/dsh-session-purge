@@ -268,6 +268,12 @@ request: it is left out of the preview, it travels with the run as
 `excludeSessionIds`, and switching conversation drops the preview and its
 consent.
 
+**Two surfaces, two populations.** The selection manager lists the host's live
+session index (5403 rows on the measured profile), while the policy counts the
+purge store's stored logs (5440 on the same profile). A session that exists in
+one and not the other is why the two numbers differ; the policy is the one that
+decides what can be removed.
+
 ## Compatibility notes (verified against DSH `0.2.0-rc.2`)
 
 Four changes in this package exist because the rc.2 runtime rejected or misloaded

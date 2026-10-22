@@ -690,6 +690,44 @@ describe('the retention policy overlay', () => {
     expect(container.textContent).toContain('186.1 MB to free')
     // And the run's own share is spelled out.
     expect(container.textContent).toContain('this run removes the first 3')
+    // The "more" line counts against the same denominator as the headline, so
+    // the two lines cannot be read as different populations.
+    expect(container.textContent).toContain('and 5420 more')
+  })
+
+  it('omits the byte total instead of rendering a placeholder when the host sends none', async () => {
+    const harness = freshClient()
+    // A host that does not know the run's byte total: the line must read as a
+    // sentence, not as "(—)".
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) => {
+      if (String(url).includes('/policy/preview')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          totalSessions: 12,
+          selectedCount: 2,
+          totalSelected: 9,
+          keptCount: 3,
+          bytesToFree: 2048,
+          // The host does not know the run's byte total, and the policy flags
+          // more than one run lists, so the truncation line DOES render.
+          truncated: true,
+          selected: [
+            { id: ID_A, exists: true, createdAt: Date.now(), ageDays: 40, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+            { id: ID_B, exists: true, createdAt: Date.now(), ageDays: 35, sizeBytes: 1024, liveAgent: 'idle', attached: false, deletable: true, blockedReason: '' },
+          ],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    harness.controller.openPolicy()
+    const container = mount(harness, 'session-purge-policy', {})
+    act(() => { setInputValue(numberInputs(container)[0], '30') })
+    clickButton(container, 'Preview policy')
+    await flush()
+    // The line renders, and it reads as a sentence.
+    expect(container.textContent).toContain('this run removes the first 2')
+    expect(container.textContent).not.toContain('(—)')
+    expect(container.textContent).not.toContain('( )')
   })
 
   it('drops the preview when a limit changes, so the run cannot act on a stale selection', async () => {

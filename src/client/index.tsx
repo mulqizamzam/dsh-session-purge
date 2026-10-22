@@ -23,6 +23,7 @@ type LocaleKey =
   | 'impactReasonLive' | 'impactReasonInvalid' | 'impactReasonRegistry' | 'impactReasonStat'
   | 'policyLabel' | 'policyTitle' | 'policyHint' | 'policyAgeLabel' | 'policyCountLabel' | 'policySizeLabel'
   | 'policyPreviewAction' | 'policyApplyAction' | 'policyPreviewTitle' | 'policySummary' | 'policyTruncated'
+  | 'policyTruncatedNoSize'
   | 'policyBlocked' | 'policyNothing' | 'policyConsent' | 'policyResult' | 'policyWorking'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -44,7 +45,7 @@ const en: LocaleDictOf<typeof NS> = {
   selectMode: 'Select sessions',
   managerTitle: 'Select sessions to delete',
   managerEmpty: 'No deletable sessions are available.',
-  managerHint: 'Tick the sessions to delete, then confirm. Rows without a persisted log (blank New Session rows) and the session you are viewing are excluded.',
+  managerHint: 'Tick the sessions to delete, then confirm. Rows without a persisted log (blank New Session rows) are not offered, and the session you are viewing is shown but cannot be ticked.',
   selectAll: 'Select all',
   clearSelection: 'Clear',
   deleteSelected: 'Delete {count} selected',
@@ -76,6 +77,7 @@ const en: LocaleDictOf<typeof NS> = {
   policyPreviewTitle: 'What the policy would remove',
   policySummary: '{count} of {total} sessions selected · {size} to free',
   policyTruncated: 'The policy flags {count} sessions; this run removes the first {shown} ({size}). Apply it, then run it again for the rest.',
+  policyTruncatedNoSize: 'The policy flags {count} sessions; this run removes the first {shown}. Apply it, then run it again for the rest.',
   policyBlocked: '{count} sessions cannot be removed right now.',
   policyNothing: 'Nothing to remove: every stored session is inside the limits.',
   policyConsent: 'I understand this permanently removes the selected sessions.',
@@ -95,7 +97,7 @@ const zh: LocaleDictOf<typeof NS> = {
   selectMode: '选择会话',
   managerTitle: '选择要删除的会话',
   managerEmpty: '没有可删除的会话。',
-  managerHint: '勾选要删除的会话，然后确认。没有持久日志的行（空白的新建会话行）和您当前所在的会话不可选。',
+  managerHint: '勾选要删除的会话，然后确认。没有持久日志的行（空白的新建会话行）不会列出，您当前所在的会话会显示但无法勾选。',
   selectAll: '全选',
   clearSelection: '清除',
   deleteSelected: '删除所选 {count} 个',
@@ -127,6 +129,7 @@ const zh: LocaleDictOf<typeof NS> = {
   policyPreviewTitle: '策略将移除的内容',
   policySummary: '已选择 {total} 个会话中的 {count} 个 · 可释放 {size}',
   policyTruncated: '策略标记了 {count} 个会话；本次运行删除前 {shown} 个（{size}）。请先应用，再运行一次处理其余部分。',
+  policyTruncatedNoSize: '策略标记了 {count} 个会话；本次运行删除前 {shown} 个。请先应用，再运行一次处理其余部分。',
   policyBlocked: '当前有 {count} 个会话无法移除。',
   policyNothing: '无需移除：所有已存储会话都在限制范围内。',
   policyConsent: '我理解此操作将永久移除所选会话。',
@@ -449,6 +452,10 @@ function PolicyOverlay({ controller, t }: OverlayProps) {
     && preview.selected.length > 0
     && state.policyAcknowledged
     && !state.policyBusy
+  // How many of the flagged sessions are named in the list. The rest are
+  // counted against the policy's total, so the two lines agree on the
+  // denominator the operator is consenting to.
+  const shownRows = preview === null ? 0 : Math.min(8, preview.selected.length)
   const limitField = (
     label: string,
     value: string,
@@ -512,7 +519,7 @@ function PolicyOverlay({ controller, t }: OverlayProps) {
                       operator consents to these ids, so it must be able to see
                       which ones they are. */}
                   <ul style={{ listStyle: 'none', margin: '8px 0 0', padding: 0, maxHeight: 140, overflowY: 'auto' }}>
-                    {preview.selected.slice(0, 8).map(row => {
+                    {preview.selected.slice(0, shownRows).map(row => {
                       const reasonKey = REASON_KEYS[row.blockedReason]
                       return (
                         <li key={row.id} style={{ display: 'flex', gap: 8, justifyContent: 'space-between', fontSize: 12, padding: '2px 0' }}>
@@ -534,18 +541,23 @@ function PolicyOverlay({ controller, t }: OverlayProps) {
                       )
                     })}
                   </ul>
-                  {preview.selected.length > 8 && (
+                  {preview.totalSelected > shownRows && (
                     <div style={{ fontSize: 12, opacity: 0.7 }}>
-                      {t('batchMore', { count: preview.selected.length - 8 })}
+                      {t('batchMore', { count: preview.totalSelected - shownRows })}
                     </div>
                   )}
                   {preview.truncated && (
                     <div style={{ fontSize: 12, opacity: 0.7 }}>
-                      {t('policyTruncated', {
-                        count: preview.totalSelected,
-                        shown: preview.selectedCount,
-                        size: formatBytes(preview.bytesThisRun),
-                      })}
+                      {preview.bytesThisRun === null
+                        ? t('policyTruncatedNoSize', {
+                          count: preview.totalSelected,
+                          shown: preview.selectedCount,
+                        })
+                        : t('policyTruncated', {
+                          count: preview.totalSelected,
+                          shown: preview.selectedCount,
+                          size: formatBytes(preview.bytesThisRun),
+                        })}
                     </div>
                   )}
                   {preview.blocked.length > 0 && (
