@@ -102,11 +102,14 @@ Response:
 - `blockedReason` is `''` when nothing blocks the deletion, and otherwise one of
   `invalid-session-id` (a malformed id), `session-live` (a live agent the host
   can neither dispose nor stop), `agent-registry-unavailable` (the host exposes
-  no agent registry) or `stat-failed` (the host could not read this log). A
-  session with no stored log is not a blocker: `exists: false` says it, and
-  deleting an absent log is a successful no-op. A malformed or unreadable id is
-  reported per item instead of failing the whole request, so one unusable id
-  cannot hide the others.
+  no agent registry) or `stat-failed` (the host could not read this log). The
+  first two are mutually exclusive by construction: without an agent registry
+  the live state is `unknown`, and that check comes first, so
+  `agent-registry-unavailable` always wins and `session-live` needs a working
+  registry to be reachable at all. A session with no stored log is not a
+  blocker: `exists: false` says it, and deleting an absent log is a successful
+  no-op. A malformed or unreadable id is reported per item instead of failing
+  the whole request, so one unusable id cannot hide the others.
 - The panel is advisory. When the preview cannot be read, the dialog still
   deletes — only the consent checkbox gates the destructive button. After a
   partial batch failure the panel is read again for the pending remainder, so it
