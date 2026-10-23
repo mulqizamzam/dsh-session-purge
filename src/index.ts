@@ -117,7 +117,10 @@ function json(data: unknown, status = 200): Response {
  */
 function originFence(request: Request): Response | null {
   const origin = request.headers.get('origin')
-  if (!origin) return null
+  // Require Origin header for all mutating endpoints. A missing Origin header
+  // indicates a non-browser client or a request that bypassed the browser's
+  // same-origin policy. The host's own /api trust fence requires Origin.
+  if (!origin) return json({ ok: false, error: 'origin-header-required' }, 403)
   const authority = hostAuthority(request.headers.get('host'))
   let originHost: string
   try {

@@ -195,7 +195,7 @@ describe('the policy routes', () => {
     const { routes } = await opened(policyCapableHost().services)
     const response = await routes[2].fetch(new Request(new URL(POLICY_PREVIEW_PATH, 'http://dsh.internal'), {
       method: 'POST',
-      headers: { 'content-type': 'text/plain' },
+      headers: { 'content-type': 'text/plain', 'host': '127.0.0.1:13080', 'origin': 'http://127.0.0.1:13080' },
       body: '{}',
     }))
     expect(response.status).toBe(415)

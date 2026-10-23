@@ -334,7 +334,7 @@ describe('POST /api/session-purge/preview', () => {
     const { routes } = await opened(previewCapableHost().services)
     const response = await routes[1].fetch(new Request(new URL(PREVIEW_PATH, 'http://dsh.internal'), {
       method: 'POST',
-      headers: { 'content-type': 'text/plain' },
+      headers: { 'content-type': 'text/plain', 'host': '127.0.0.1:13080', 'origin': 'http://127.0.0.1:13080' },
       body: '{}',
     }))
     expect(response.status).toBe(415)

@@ -201,13 +201,13 @@ describe('POST /api/session-purge/delete origin gate', () => {
     expect(deleteCalls).toEqual([{ id: ID, options: expect.any(Object) }])
   })
 
-  it('admits a request with no Origin header (non-browser clients reach the host fence instead)', async () => {
+  it('rejects a request with no Origin header (security hardening: requires Origin for mutating endpoints)', async () => {
     const deleted: string[] = []
     const { routes } = await opened(deleteCapablePersistence(deleted))
     const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, { host: '127.0.0.1:13080' })
-    expect(status).toBe(200)
-    expect(payload.ok).toBe(true)
-    expect(deleted).toEqual([ID])
+    expect(status).toBe(403)
+    expect(payload.error).toBe('origin-header-required')
+    expect(deleted).toEqual([])
   })
 
   it('matches authorities through URL normalization, not raw strings', async () => {
