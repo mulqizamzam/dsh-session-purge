@@ -143,11 +143,42 @@ function FooterBatchButton({ controller, t }: FooterProps) {
   )
 }
 
-function RowCheckboxInjector({ controller, t }: OverlayProps) {
+function RowCheckboxInjector({ controller }: OverlayProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
-  const observerRef = useRef<MutationObserver | null>(null)
-  const injectedRef = useRef(new Set<string>())
   const rowsRef = useRef<Map<string, SessionRow>>(new Map())
+  const boxesRef = useRef<Map<string, HTMLElement>>(new Map())   // session rowKey -> box
+  const wsBoxesRef = useRef<Map<string, HTMLElement>>(new Map()) // workspace key -> box
+  const syncRef = useRef<() => void>(() => {})
+
+  /** Sync aria-checked/data-state on all injected checkboxes from current selection. */
+  const syncBoxes = (): void => {
+    const selected = new Set<string>(controller.getSnapshot().selected.map(id => String(id)))
+    boxesRef.current.forEach((box, key) => {
+      const id = key.slice('session:'.length)
+      const on = selected.has(id)
+      box.dataset.state = on ? 'on' : 'off'
+      box.setAttribute('aria-checked', on ? 'true' : 'false')
+    })
+    wsBoxesRef.current.forEach((box, key) => {
+      const group = document.querySelector<HTMLElement>(`[data-row-key="${key}"]`)
+        ?.closest('div[class*="groupSection"]')
+      if (!group) return
+      const ids: string[] = []
+      group.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(el => {
+        const k = el.dataset.rowKey
+        if (k) ids.push(k.slice('session:'.length))
+      })
+      const count = ids.filter(id => selected.has(id)).length
+      const next = ids.length > 0 && count === ids.length ? 'on'
+        : count > 0 ? 'mixed' : 'off'
+      box.dataset.state = next
+      box.setAttribute('aria-checked', next === 'mixed' ? 'mixed' : next === 'on' ? 'true' : 'false')
+    })
+  }
+  syncRef.current = syncBoxes
+
+  // Repaint when selection changes; injection stays stable.
+  useEffect(() => { syncRef.current() }, [state.selected])
 
   useEffect(() => {
     const getSessionRow = (row: HTMLElement): SessionRow | null => {
@@ -156,105 +187,160 @@ function RowCheckboxInjector({ controller, t }: OverlayProps) {
       const idStr = key.replace('session:', '')
       const existing = rowsRef.current.get(key)
       if (existing) return existing
-      // Try to extract title from the row's title element
-      const titleEl = row.querySelector('[data-slot="title"]') || row.firstElementChild
-      const title = titleEl instanceof HTMLElement ? titleEl.textContent?.trim() || idStr : idStr
+      // Prefer a dedicated title element; fall back to first text-bearing child.
+      const titleEl = row.querySelector('[class*="title"]')
+        || row.querySelector('[data-slot="title"]')
+        || row.firstElementChild
+      const title = titleEl instanceof HTMLElement
+        ? titleEl.textContent?.trim() || idStr : idStr
       const sessionId = idStr as SessionId
       const sessionRow: SessionRow = { sessionId, title, running: false }
       rowsRef.current.set(key, sessionRow)
       return sessionRow
     }
 
-    const inject = (row: HTMLElement): void => {
+    const makeBox = (label: string): HTMLElement => {
+      const box = document.createElement('span')
+      box.className = 'dsh-srp-box'
+      box.dataset.state = 'off'
+      box.setAttribute('role', 'checkbox')
+      box.setAttribute('aria-checked', 'false')
+      box.setAttribute('aria-label', label)
+      box.tabIndex = 0
+      return box
+    }
+
+    const stop = (event: Event): void => { event.stopPropagation() }
+
+    // Return session ids that belong to the given workspace row (in its groupSection).
+    const sessionsOf = (wsRow: HTMLElement): SessionId[] => {
+      const group = wsRow.closest('div[class*="groupSection"]')
+      if (!group) return []
+      const ids: SessionId[] = []
+      group.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(el => {
+        const k = el.dataset.rowKey
+        if (k) ids.push(k.slice('session:'.length) as SessionId)
+      })
+      return ids
+    }
+
+    const injectSession = (row: HTMLElement): void => {
       const key = row.dataset.rowKey
       if (!key || !key.startsWith('session:')) return
-      if (injectedRef.current.has(key)) return
-      injectedRef.current.add(key)
-
+      if (row.querySelector(':scope > .dsh-srp-box')) return
       const sessionRow = getSessionRow(row)
       if (!sessionRow) return
-
-      const slot = row.querySelector('[data-slot]') || row.firstElementChild
-      if (!slot) return
-      const cb = document.createElement('input')
-      cb.type = 'checkbox'
-      cb.className = 'dsh-srp-checkbox'
-      cb.dataset.sessionId = key.replace('session:', '')
-      cb.checked = state.selected.includes(cb.dataset.sessionId as SessionId)
-      const onCheck = (): void => {
-        controller.toggle(cb.dataset.sessionId as SessionId)
-        cb.checked = state.selected.includes(cb.dataset.sessionId as SessionId)
-      }
-      cb.addEventListener('change', onCheck)
-      // Prevent checkbox click from opening the session
-      cb.addEventListener('pointerdown', (e: Event) => { e.stopPropagation() })
-      slot.appendChild(cb)
+      const id = key.slice('session:'.length) as SessionId
+      const box = makeBox(sessionRow.title || 'session')
+      box.addEventListener('pointerdown', stop)
+      box.addEventListener('mousedown', stop)
+      box.addEventListener('click', event => {
+        event.preventDefault()
+        event.stopPropagation()
+        controller.toggle(id)
+      })
+      box.addEventListener('keydown', event => {
+        if (event.key !== ' ' && event.key !== 'Enter') return
+        event.preventDefault()
+        event.stopPropagation()
+        controller.toggle(id)
+      })
+      row.insertBefore(box, row.firstChild)
+      boxesRef.current.set(key, box)
+      syncRef.current()
     }
 
-    const cleanup = (row: HTMLElement): void => {
+    const injectWorkspace = (row: HTMLElement): void => {
       const key = row.dataset.rowKey
-      if (!key || !key.startsWith('session:')) return
-      if (!injectedRef.current.has(key)) return
-      injectedRef.current.delete(key)
-      rowsRef.current.delete(key)
-      row.querySelectorAll<HTMLInputElement>('.dsh-srp-checkbox').forEach(el => el.remove())
+      if (!key || !key.startsWith('workspace:')) return
+      if (row.querySelector(':scope > .dsh-srp-box')) return
+      const ids = sessionsOf(row)
+      if (ids.length === 0) return // no rendered sessions — skip
+      const box = makeBox('Select every session in this workspace')
+      box.addEventListener('pointerdown', stop)
+      box.addEventListener('mousedown', stop)
+      box.addEventListener('click', event => {
+        event.preventDefault()
+        event.stopPropagation()
+        controller.toggleMany(ids)
+      })
+      box.addEventListener('keydown', event => {
+        if (event.key !== ' ' && event.key !== 'Enter') return
+        event.preventDefault()
+        event.stopPropagation()
+        controller.toggleMany(ids)
+      })
+      row.insertBefore(box, row.firstChild)
+      wsBoxesRef.current.set(key, box)
+      syncRef.current()
     }
 
-    // Collect all current rows
+    // Initial scan.
+    document.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(injectSession)
+    document.querySelectorAll<HTMLElement>('[data-row-key^="workspace:"]').forEach(injectWorkspace)
+
+    // Collect all session rows for the batch dialog's availableRows.
     const allRows: SessionRow[] = []
     document.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(row => {
-      const sessionRow = getSessionRow(row)
-      if (sessionRow) allRows.push(sessionRow)
-      inject(row)
+      const sr = getSessionRow(row)
+      if (sr) allRows.push(sr)
     })
     controller.setAvailableRows(allRows)
+    syncRef.current()
 
-    // Watch for new rows
     const obs = new MutationObserver(mutations => {
       for (const m of mutations) {
         for (const node of m.addedNodes) {
           if (!(node instanceof HTMLElement)) continue
-          if (node.dataset.rowKey?.startsWith('session:')) {
-            const sessionRow = getSessionRow(node)
-            if (sessionRow) {
-              allRows.push(sessionRow)
-              controller.setAvailableRows([...allRows])
-            }
-            inject(node)
-          }
-          node.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(row => {
-            const sessionRow = getSessionRow(row)
-            if (sessionRow && !allRows.find(r => r.sessionId === sessionRow.sessionId)) {
-              allRows.push(sessionRow)
-              controller.setAvailableRows([...allRows])
-            }
-            inject(row)
-          })
+          if (node.dataset.rowKey?.startsWith('session:')) injectSession(node)
+          if (node.dataset.rowKey?.startsWith('workspace:')) injectWorkspace(node)
+          node.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(injectSession)
+          node.querySelectorAll<HTMLElement>('[data-row-key^="workspace:"]').forEach(injectWorkspace)
         }
         for (const node of m.removedNodes) {
           if (!(node instanceof HTMLElement)) continue
-          if (node.dataset.rowKey?.startsWith('session:')) cleanup(node)
-          node.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(cleanup)
+          const key = node.dataset.rowKey
+          if (key?.startsWith('session:')) { rowsRef.current.delete(key); boxesRef.current.delete(key) }
+          if (key?.startsWith('workspace:')) wsBoxesRef.current.delete(key)
         }
       }
+      // Rebuild availableRows so the batch dialog stays accurate.
+      const updated: SessionRow[] = []
+      document.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(row => {
+        const sr = getSessionRow(row)
+        if (sr) updated.push(sr)
+      })
+      controller.setAvailableRows(updated)
+      syncRef.current()
     })
     obs.observe(document.body, { childList: true, subtree: true })
-    observerRef.current = obs
 
     return () => {
       obs.disconnect()
-      observerRef.current = null
-      // Remove ALL injected checkboxes from DOM to prevent duplicates on re-run
-      document.querySelectorAll<HTMLInputElement>('.dsh-srp-checkbox').forEach(el => el.remove())
-      injectedRef.current.clear()
+      document.querySelectorAll('.dsh-srp-box').forEach(el => el.remove())
       rowsRef.current.clear()
+      boxesRef.current.clear()
+      wsBoxesRef.current.clear()
     }
   }, [controller])
 
-  // Inject CSS
+  // One stylesheet: a painted box with a guaranteed-visible tick, immune to DSH resets.
   useEffect(() => {
     const style = document.createElement('style')
-    style.textContent = 'input.dsh-srp-checkbox{flex:none;width:14px;height:14px;margin:0 4px 0 0;cursor:pointer;accent-color:var(--dsh-danger,#b42318)}'
+    style.textContent = [
+      '.dsh-srp-box{flex:none;display:inline-flex;align-items:center;justify-content:center;',
+      'width:15px;height:15px;margin:0 6px 0 0;padding:0;border-radius:4px;cursor:pointer;',
+      'border:1.5px solid var(--dsw-alias-border-secondary,#8a8a8a);background:transparent;',
+      'transition:background .12s ease,border-color .12s ease;color:transparent;font-size:12px}',
+      '.dsh-srp-box:hover{border-color:var(--dsh-danger,#b42318)}',
+      '.dsh-srp-box:focus-visible{outline:2px solid var(--dsh-accent,#4c8dff);outline-offset:2px}',
+      '.dsh-srp-box[data-state="on"],.dsh-srp-box[data-state="mixed"]{',
+      'background:var(--dsh-danger,#b42318);border-color:var(--dsh-danger,#b42318);color:#fff}',
+      '.dsh-srp-box::after{content:"";width:8px;height:4px;border-left:2px solid #fff;',
+      'border-bottom:2px solid #fff;transform:rotate(-45deg) translate(0,-1px);opacity:0}',
+      '.dsh-srp-box[data-state="on"]::after{opacity:1}',
+      '.dsh-srp-box[data-state="mixed"]::after{width:8px;height:2px;border:0;background:#fff;transform:none;opacity:1}',
+    ].join('')
     document.head.appendChild(style)
     return () => { style.remove() }
   }, [])

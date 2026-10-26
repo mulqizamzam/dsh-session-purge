@@ -72,6 +72,19 @@ export class SessionPurgeController {
     this.setState({ ...this.state, selected })
   }
 
+  /** Toggle all given session ids to the opposite of their current state (workspace checkbox). */
+  toggleMany(sessionIds: readonly SessionId[]): void {
+    if (sessionIds.length === 0) return
+    const current = new Set(this.state.selected.map(id => String(id)))
+    const allOn = sessionIds.every(id => current.has(String(id)))
+    const next = new Set<string>(current)
+    for (const id of sessionIds) {
+      if (allOn) next.delete(String(id))
+      else next.add(String(id))
+    }
+    this.setState({ ...this.state, selected: [...next] as SessionId[] })
+  }
+
   selectAll(rows: readonly SessionRow[]): void {
     const ids = rows.map(r => r.sessionId)
     const allSelected = ids.length > 0 && ids.every(id => this.state.selected.includes(id))
