@@ -235,7 +235,28 @@ export function apply(ctx: Context): void {
         return json({ ok: false, error: 'invalid-json' }, 400)
       }
       if (!body || typeof body !== 'object') return json({ ok: false, error: 'invalid-request' }, 400)
-      const input = body as { sessionId?: unknown; confirm?: unknown }
+      const input = body as { sessionId?: unknown; sessionIds?: unknown; confirm?: unknown }
+      // Batch mode: sessionIds (array) + confirm
+      if (Array.isArray(input.sessionIds) && input.confirm === true) {
+        const ids = input.sessionIds as string[]
+        if (ids.length === 0) return json({ ok: false, error: 'empty-sessionIds' }, 400)
+        const results = []
+        for (const id of ids) {
+          try {
+            const result = await purgeSession(runtime, id, request.signal, (error, stage) => {
+              logUnexpected(ctx, error, stage)
+            })
+            if (result.log) announceRemoval(ctx, result.id)
+            results.push(result)
+          } catch (error) {
+            results.push({ ok: false, id, error: publicErrorMessage(error), stage: 'route' })
+          }
+        }
+        // Invalidate list cache once after all deletions
+        try { await purgeSessionListCache(ctx) } catch { /* best-effort */ }
+        return json({ ok: true, results }, 200)
+      }
+      // Single mode: sessionId + confirm
       if (typeof input.sessionId !== 'string' || input.confirm !== true) {
         return json({ ok: false, error: 'sessionId-and-confirm-true-required' }, 400)
       }
