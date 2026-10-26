@@ -7,7 +7,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
-import { MenuItemButton } from '@deepseek-ai/dsh-client-ui-primitives'
+import { MenuItemButton, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, LocaleDictOf, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { SessionPurgeController, type SessionRow } from './controller.ts'
 
@@ -265,55 +265,20 @@ function ConfirmOverlay({ controller, t }: OverlayProps) {
   const token = target !== null ? target.token : batch !== null ? batch.token : null
   const acknowledged = token !== null && acknowledgedToken === token
   if (token === null) return null
+  const open = token !== null
+  const title = target !== null ? t('title') : t('batchTitle', { count: batch?.items.length ?? 0 })
+  const description = target !== null
+    ? (target.title || target.sessionId)
+    : undefined
   return (
-    <div
-      role="presentation"
-      onMouseDown={event => { if (event.target === event.currentTarget && !state.busy) controller.close() }}
-      style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0008', display: 'grid', placeItems: 'center', padding: 16 }}
-    >
-      <section
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="session-purge-title"
-        style={{ width: 'min(480px, 100%)', maxHeight: 'min(80vh, 720px)', overflowY: 'auto', padding: 24, borderRadius: 14, background: 'var(--dsh-panel, Canvas)', color: 'var(--dsh-text, CanvasText)', boxShadow: '0 18px 60px #0005' }}
-      >
-        {target !== null
-          ? (
-            <>
-              <h2 id="session-purge-title" style={{ marginTop: 0 }}>{t('title')}</h2>
-              <p style={{ overflowWrap: 'anywhere' }}><strong>{target.title || target.sessionId}</strong></p>
-            </>
-          )
-          : (
-            <>
-              <h2 id="session-purge-title" style={{ marginTop: 0 }}>{t('batchTitle', { count: batch?.items.length ?? 0 })}</h2>
-              <ul style={{ margin: '8px 0', paddingLeft: 20 }}>
-                {(batch?.items ?? []).slice(0, 6).map(item => (
-                  <li key={item.sessionId} style={{ overflowWrap: 'anywhere' }}>{item.title || item.sessionId}</li>
-                ))}
-                {(batch?.items.length ?? 0) > 6 && (
-                  <li style={{ opacity: 0.7 }}>{t('batchMore', { count: (batch?.items.length ?? 0) - 6 })}</li>
-                )}
-              </ul>
-            </>
-          )}
-        <p>{t('body')}</p>
-        <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '16px 0' }}>
-          <input type="checkbox" checked={acknowledged} disabled={state.busy} onChange={event => setAcknowledgedToken(event.target.checked ? token : null)} />
-          <span>{t('consent')}</span>
-        </label>
-        {state.error && <p role="alert" style={{ color: 'var(--dsh-danger, #c33)', whiteSpace: 'pre-wrap' }}>{t('failedPrefix')}: {state.error}</p>}
-        {state.itemFailures.length > 0 && (
-          <ul role="alert" style={{ color: 'var(--dsh-danger, #c33)', margin: '8px 0', paddingLeft: 20, maxHeight: 160, overflowY: 'auto' }}>
-            {state.itemFailures.slice(0, 8).map(failure => (
-              <li key={failure.sessionId} style={{ overflowWrap: 'anywhere' }}>
-                {failure.title || failure.sessionId}: {failure.error}
-              </li>
-            ))}
-          </ul>
-        )}
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 }}>
-          <button type="button" disabled={state.busy} onClick={() => controller.close()}>{t('cancel')}</button>
+    <Modal
+      open={open}
+      onClose={() => controller.close()}
+      title={title}
+      closeLabel={t('cancel')}
+      footer={(
+        <>
+          <button type="button" disabled={state.busy} onClick={() => controller.close()} style={ghostButtonStyle}>{t('cancel')}</button>
           <button
             type="button"
             disabled={!acknowledged || state.busy}
@@ -322,13 +287,37 @@ function ConfirmOverlay({ controller, t }: OverlayProps) {
           >
             {state.busy
               ? t('working')
-              : target !== null
-                ? t('confirm')
-                : t('confirmBatch', { count: batch?.items.length ?? 0 })}
+              : target !== null ? t('confirm') : t('confirmBatch', { count: batch?.items.length ?? 0 })}
           </button>
-        </div>
-      </section>
-    </div>
+        </>
+      )}
+    >
+      {target === null && batch !== null && (
+        <ul style={{ margin: '8px 0', paddingLeft: 20 }}>
+          {(batch.items ?? []).slice(0, 6).map(item => (
+            <li key={item.sessionId} style={{ overflowWrap: 'anywhere' }}>{item.title || item.sessionId}</li>
+          ))}
+          {(batch.items.length ?? 0) > 6 && (
+            <li style={{ opacity: 0.7 }}>{t('batchMore', { count: (batch.items.length ?? 0) - 6 })}</li>
+          )}
+        </ul>
+      )}
+      <p>{t('body')}</p>
+      <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '16px 0' }}>
+        <input type="checkbox" checked={acknowledged} disabled={state.busy} onChange={event => setAcknowledgedToken(event.target.checked ? token : null)} />
+        <span>{t('consent')}</span>
+      </label>
+      {state.error && <p role="alert" style={{ color: 'var(--dsh-danger, #c33)', whiteSpace: 'pre-wrap' }}>{t('failedPrefix')}: {state.error}</p>}
+      {state.itemFailures.length > 0 && (
+        <ul role="alert" style={{ color: 'var(--dsh-danger, #c33)', margin: '8px 0', paddingLeft: 20, maxHeight: 160, overflowY: 'auto' }}>
+          {state.itemFailures.slice(0, 8).map(failure => (
+            <li key={failure.sessionId} style={{ overflowWrap: 'anywhere' }}>
+              {failure.title || failure.sessionId}: {failure.error}
+            </li>
+          ))}
+        </ul>
+      )}
+    </Modal>
   )
 }
 
