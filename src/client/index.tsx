@@ -39,11 +39,11 @@ const en: LocaleDictOf<typeof NS> = {
   deleteSelected: 'Delete {count} selected',
   batchTitle: 'Delete {count} sessions permanently?',
   batchMore: '…and {count} more.',
+  confirmBatch: 'Delete {count} permanently',
   running: 'running',
   currentSession: 'current session',
   currentSessionNote: 'The session you are viewing cannot be included in a batch delete.',
   toastDeleted: '{count} sessions deleted',
-  confirmBatch: 'Delete {count} permanently',
   toastFailed: 'Deletion failed',
 }
 const zh: LocaleDictOf<typeof NS> = {
@@ -62,11 +62,11 @@ const zh: LocaleDictOf<typeof NS> = {
   deleteSelected: '删除所选 {count} 个',
   batchTitle: '永久删除 {count} 个会话？',
   batchMore: '……以及另外 {count} 个。',
+  confirmBatch: '永久删除 {count} 个',
   running: '运行中',
   currentSession: '当前会话',
   currentSessionNote: '当前所在的会话不能包含在批量删除中。',
   toastDeleted: '已删除 {count} 个会话',
-  confirmBatch: '永久删除 {count} 个',
   toastFailed: '删除失败',
 }
 
@@ -142,13 +142,32 @@ function RowCheckboxInjector({ controller, t }: OverlayProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
   const observerRef = useRef<MutationObserver | null>(null)
   const injectedRef = useRef(new Set<string>())
+  const rowsRef = useRef<Map<string, SessionRow>>(new Map())
 
   useEffect(() => {
+    const getSessionRow = (row: HTMLElement): SessionRow | null => {
+      const key = row.dataset.rowKey
+      if (!key || !key.startsWith('session:')) return null
+      const idStr = key.replace('session:', '')
+      const existing = rowsRef.current.get(key)
+      if (existing) return existing
+      // Try to extract title from the row's title element
+      const titleEl = row.querySelector('[data-slot="title"]') || row.firstElementChild
+      const title = titleEl instanceof HTMLElement ? titleEl.textContent?.trim() || idStr : idStr
+      const sessionId = idStr as SessionId
+      const sessionRow: SessionRow = { sessionId, title, running: false }
+      rowsRef.current.set(key, sessionRow)
+      return sessionRow
+    }
+
     const inject = (row: HTMLElement): void => {
       const key = row.dataset.rowKey
       if (!key || !key.startsWith('session:')) return
       if (injectedRef.current.has(key)) return
       injectedRef.current.add(key)
+
+      const sessionRow = getSessionRow(row)
+      if (!sessionRow) return
 
       const slot = row.querySelector('[data-slot]') || row.firstElementChild
       if (!slot) return
@@ -162,6 +181,8 @@ function RowCheckboxInjector({ controller, t }: OverlayProps) {
         cb.checked = state.selected.includes(cb.dataset.sessionId as SessionId)
       }
       cb.addEventListener('change', onCheck)
+      // Prevent checkbox click from opening the session
+      cb.addEventListener('pointerdown', (e: Event) => { e.stopPropagation() })
       slot.appendChild(cb)
     }
 
@@ -170,17 +191,40 @@ function RowCheckboxInjector({ controller, t }: OverlayProps) {
       if (!key || !key.startsWith('session:')) return
       if (!injectedRef.current.has(key)) return
       injectedRef.current.delete(key)
+      rowsRef.current.delete(key)
       row.querySelectorAll<HTMLInputElement>('.dsh-srp-checkbox').forEach(el => el.remove())
     }
 
-    document.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(inject)
+    // Collect all current rows
+    const allRows: SessionRow[] = []
+    document.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(row => {
+      const sessionRow = getSessionRow(row)
+      if (sessionRow) allRows.push(sessionRow)
+      inject(row)
+    })
+    controller.setAvailableRows(allRows)
 
+    // Watch for new rows
     const obs = new MutationObserver(mutations => {
       for (const m of mutations) {
         for (const node of m.addedNodes) {
           if (!(node instanceof HTMLElement)) continue
-          if (node.dataset.rowKey?.startsWith('session:')) inject(node)
-          node.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(inject)
+          if (node.dataset.rowKey?.startsWith('session:')) {
+            const sessionRow = getSessionRow(node)
+            if (sessionRow) {
+              allRows.push(sessionRow)
+              controller.setAvailableRows([...allRows])
+            }
+            inject(node)
+          }
+          node.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(row => {
+            const sessionRow = getSessionRow(row)
+            if (sessionRow && !allRows.find(r => r.sessionId === sessionRow.sessionId)) {
+              allRows.push(sessionRow)
+              controller.setAvailableRows([...allRows])
+            }
+            inject(row)
+          })
         }
         for (const node of m.removedNodes) {
           if (!(node instanceof HTMLElement)) continue
@@ -196,9 +240,11 @@ function RowCheckboxInjector({ controller, t }: OverlayProps) {
       obs.disconnect()
       observerRef.current = null
       injectedRef.current.clear()
+      rowsRef.current.clear()
     }
   }, [state.selected.length, controller])
 
+  // Inject CSS
   useEffect(() => {
     const style = document.createElement('style')
     style.textContent = 'input.dsh-srp-checkbox{flex:none;width:14px;height:14px;margin:0 4px 0 0;cursor:pointer;accent-color:var(--dsh-danger,#b42318)}'
@@ -357,7 +403,7 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: (): OpenConfirmFace => ({
       openConfirm: () => {},
-      openBatch: (rows) => controller.openBatch(rows),
+      openBatch: () => controller.openBatchFromSelection(),
       selectedCount: controller.getSnapshot().selected.length,
     }),
   }, FooterBatchButton))

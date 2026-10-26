@@ -28,6 +28,7 @@ export interface PurgeUiState {
   readonly target: DeleteTarget | null
   readonly batch: BatchDialog | null
   readonly selected: readonly SessionId[]
+  readonly availableRows: readonly SessionRow[]
   readonly busy: boolean
   readonly error: string | null
   readonly itemFailures: readonly ItemFailure[]
@@ -41,6 +42,7 @@ export class SessionPurgeController {
     target: null,
     batch: null,
     selected: [],
+    availableRows: [],
     busy: false,
     error: null,
     itemFailures: [],
@@ -56,6 +58,11 @@ export class SessionPurgeController {
   readonly subscribe = (listener: Listener): (() => void) => {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
+  }
+
+  /** Called by RowCheckboxInjector when rows are injected into DOM. */
+  setAvailableRows(rows: readonly SessionRow[]): void {
+    this.setState({ ...this.state, availableRows: rows })
   }
 
   toggle(sessionId: SessionId): void {
@@ -79,8 +86,10 @@ export class SessionPurgeController {
     this.setState({ ...this.state, selected: [] })
   }
 
-  openBatch(rows: readonly SessionRow[]): void {
-    const chosen = rows.filter(r => this.state.selected.includes(r.sessionId))
+  /** Open batch dialog with currently selected sessions from available rows. */
+  openBatchFromSelection(): void {
+    if (this.state.selected.length === 0) return
+    const chosen = this.state.availableRows.filter(r => this.state.selected.includes(r.sessionId))
     if (chosen.length === 0) return
     const token = this.nextToken++
     this.setState({
@@ -150,6 +159,7 @@ export class SessionPurgeController {
       const sessionId = target.sessionId
       const selected = this.state.selected.filter(id => id !== sessionId)
       this.setState({
+        ...this.state,
         target: null,
         batch: null,
         busy: false,
@@ -201,6 +211,7 @@ export class SessionPurgeController {
       try { await this.refreshList() } catch { /* host events may still update the list */ }
       const remaining = this.state.selected.filter(id => !succeeded.includes(id))
       this.setState({
+        ...this.state,
         batch: null,
         target: null,
         busy: false,
