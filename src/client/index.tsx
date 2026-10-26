@@ -75,7 +75,7 @@ interface OpenConfirmFace {
   openBatch: (rows: readonly SessionRow[]) => void
   selectedCount: number
 }
-type HeaderProps = PropsRuntime<'conversation.session.header.utilities'> & PropsLocale<typeof NS> & InjectFace<OpenConfirmFace>
+type HeaderProps = PropsRuntime<'conversation.session.header.utilities'> & PropsLocale<typeof NS> & InjectFace<{ controller: SessionPurgeController }>
 type SidebarProps = PropsRuntime<'sidebar.workspaces.session.menu.item'> & PropsLocale<typeof NS> & InjectFace<OpenConfirmFace>
 type FooterProps = PropsRuntime<'sidebar.footer.action'> & PropsLocale<typeof NS> & InjectFace<{ controller: SessionPurgeController }>
 type OverlayProps = PropsRuntime<'shell.overlay'> & PropsLocale<typeof NS> & InjectFace<{ controller: SessionPurgeController }>
@@ -97,16 +97,19 @@ const dangerButtonStyle: React.CSSProperties = {
   cursor: 'pointer',
 }
 
-function HeaderAction({ sessionId, openConfirm, openBatch, selectedCount, t }: HeaderProps) {
+function HeaderAction({ sessionId, controller, t }: HeaderProps) {
+  const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
+  const selectedCount = state.selected.length
+  const label = selectedCount > 0 ? t('deleteSelected', { count: selectedCount }) : t('delete')
   return (
     <button
       type="button"
-      aria-label={selectedCount > 0 ? t('deleteSelected', { count: selectedCount }) : t('delete')}
-      title={selectedCount > 0 ? t('deleteSelected', { count: selectedCount }) : t('delete')}
-      onClick={() => selectedCount > 0 ? openBatch([]) : openConfirm(sessionId, '')}
+      aria-label={label}
+      title={label}
+      onClick={() => selectedCount > 0 ? controller.openBatchFromSelection() : controller.open(sessionId, '')}
       style={selectedCount > 0 ? dangerButtonStyle : ghostButtonStyle}
     >
-      {selectedCount > 0 ? `🗑 ${t('deleteSelected', { count: selectedCount })}` : '🗑 Delete'}
+      {selectedCount > 0 ? `🗑 ${label}` : `🗑 ${t('delete')}`}
     </button>
   )
 }
@@ -376,11 +379,7 @@ export function apply(ctx: ClientContext): void {
     id: 'session-purge-header',
     order: 900,
     locale: NS,
-    inject: (): OpenConfirmFace => ({
-      openConfirm: (sessionId, title) => controller.open(sessionId, title),
-      openBatch: () => controller.openBatchFromSelection(),
-      selectedCount: controller.getSnapshot().selected.length,
-    }),
+    inject: () => ({ controller }),
   }, HeaderAction))
 
   ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
