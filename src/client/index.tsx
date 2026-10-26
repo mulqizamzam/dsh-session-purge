@@ -97,16 +97,16 @@ const dangerButtonStyle: React.CSSProperties = {
   cursor: 'pointer',
 }
 
-function HeaderAction({ sessionId, openConfirm, selectedCount, t }: HeaderProps) {
+function HeaderAction({ sessionId, openConfirm, openBatch, selectedCount, t }: HeaderProps) {
   return (
     <button
       type="button"
-      aria-label={t('delete')}
-      title={t('delete')}
-      onClick={() => openConfirm(sessionId, '')}
-      style={ghostButtonStyle}
+      aria-label={selectedCount > 0 ? t('deleteSelected', { count: selectedCount }) : t('delete')}
+      title={selectedCount > 0 ? t('deleteSelected', { count: selectedCount }) : t('delete')}
+      onClick={() => selectedCount > 0 ? openBatch([]) : openConfirm(sessionId, '')}
+      style={selectedCount > 0 ? dangerButtonStyle : ghostButtonStyle}
     >
-      🗑 {selectedCount > 0 ? `${t('delete')} (${selectedCount})` : t('delete')}
+      {selectedCount > 0 ? `🗑 ${t('deleteSelected', { count: selectedCount })}` : '🗑 Delete'}
     </button>
   )
 }
@@ -378,7 +378,7 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: (): OpenConfirmFace => ({
       openConfirm: (sessionId, title) => controller.open(sessionId, title),
-      openBatch: () => {},
+      openBatch: () => controller.openBatchFromSelection(),
       selectedCount: controller.getSnapshot().selected.length,
     }),
   }, HeaderAction))
