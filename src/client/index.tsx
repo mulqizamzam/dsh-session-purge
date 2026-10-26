@@ -77,7 +77,7 @@ interface OpenConfirmFace {
 }
 type HeaderProps = PropsRuntime<'conversation.session.header.utilities'> & PropsLocale<typeof NS> & InjectFace<OpenConfirmFace>
 type SidebarProps = PropsRuntime<'sidebar.workspaces.session.menu.item'> & PropsLocale<typeof NS> & InjectFace<OpenConfirmFace>
-type FooterProps = PropsRuntime<'sidebar.footer.action'> & PropsLocale<typeof NS> & InjectFace<OpenConfirmFace>
+type FooterProps = PropsRuntime<'sidebar.footer.action'> & PropsLocale<typeof NS> & InjectFace<{ controller: SessionPurgeController }>
 type OverlayProps = PropsRuntime<'shell.overlay'> & PropsLocale<typeof NS> & InjectFace<{ controller: SessionPurgeController }>
 
 const ghostButtonStyle: React.CSSProperties = {
@@ -123,14 +123,16 @@ function SidebarMenuItem({ sessionId, displayTitle, useMenuOpenState, openConfir
   )
 }
 
-function FooterBatchButton({ t, openBatch, selectedCount }: FooterProps) {
+function FooterBatchButton({ controller, t }: FooterProps) {
+  const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
+  const selectedCount = state.selected.length
   const label = selectedCount > 0 ? t('deleteSelected', { count: selectedCount }) : t('selectMode')
   return (
     <button
       type="button"
       aria-label={label}
       title={label}
-      onClick={() => openBatch([])}
+      onClick={() => controller.openBatchFromSelection()}
       style={selectedCount > 0 ? dangerButtonStyle : ghostButtonStyle}
     >
       {selectedCount > 0 ? `🗑 ${label}` : `☑ ${label}`}
@@ -401,11 +403,7 @@ export function apply(ctx: ClientContext): void {
     id: 'session-purge-footer',
     order: 100,
     locale: NS,
-    inject: (): OpenConfirmFace => ({
-      openConfirm: () => {},
-      openBatch: () => controller.openBatchFromSelection(),
-      selectedCount: controller.getSnapshot().selected.length,
-    }),
+    inject: () => ({ controller }),
   }, FooterBatchButton))
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
