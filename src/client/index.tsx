@@ -304,7 +304,13 @@ function ConfirmOverlay({ controller, t }: OverlayProps) {
       )}
       <p>{t('body')}</p>
       <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '16px 0' }}>
-        <input type="checkbox" checked={acknowledged} disabled={state.busy} onChange={event => setAcknowledgedToken(event.target.checked ? token : null)} />
+        <input
+          type="checkbox"
+          checked={acknowledged}
+          disabled={state.busy}
+          onChange={event => { event.stopPropagation(); setAcknowledgedToken(event.target.checked ? token : null) }}
+          onClick={event => event.stopPropagation()}
+        />
         <span>{t('consent')}</span>
       </label>
       {state.error && <p role="alert" style={{ color: 'var(--dsh-danger, #c33)', whiteSpace: 'pre-wrap' }}>{t('failedPrefix')}: {state.error}</p>}
