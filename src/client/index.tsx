@@ -241,10 +241,12 @@ function RowCheckboxInjector({ controller, t }: OverlayProps) {
     return () => {
       obs.disconnect()
       observerRef.current = null
+      // Remove ALL injected checkboxes from DOM to prevent duplicates on re-run
+      document.querySelectorAll<HTMLInputElement>('.dsh-srp-checkbox').forEach(el => el.remove())
       injectedRef.current.clear()
       rowsRef.current.clear()
     }
-  }, [state.selected.length, controller])
+  }, [controller])
 
   // Inject CSS
   useEffect(() => {
@@ -392,14 +394,6 @@ export function apply(ctx: ClientContext): void {
       selectedCount: controller.getSnapshot().selected.length,
     }),
   }, SidebarMenuItem))
-
-  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
-    name: 'sidebar.footer.action',
-    id: 'session-purge-footer',
-    order: 100,
-    locale: NS,
-    inject: () => ({ controller }),
-  }, FooterBatchButton))
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
