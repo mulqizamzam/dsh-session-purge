@@ -14,7 +14,7 @@ import { SessionPurgeController, type SessionRow } from './controller.ts'
 const NS = 'session-purge'
 type LocaleKey =
   | 'delete' | 'title' | 'body' | 'consent' | 'confirm' | 'cancel' | 'working' | 'menuLabel' | 'failedPrefix'
-  | 'selectMode' | 'selectAll' | 'clearSelection' | 'deleteSelected' | 'batchTitle' | 'batchMore'
+  | 'selectMode' | 'selectAll' | 'clearSelection' | 'deleteSelected' | 'batchTitle' | 'batchMore' | 'confirmBatch'
   | 'running' | 'currentSession' | 'currentSessionNote' | 'toastDeleted' | 'toastFailed'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -43,6 +43,7 @@ const en: LocaleDictOf<typeof NS> = {
   currentSession: 'current session',
   currentSessionNote: 'The session you are viewing cannot be included in a batch delete.',
   toastDeleted: '{count} sessions deleted',
+  confirmBatch: 'Delete {count} permanently',
   toastFailed: 'Deletion failed',
 }
 const zh: LocaleDictOf<typeof NS> = {
@@ -65,6 +66,7 @@ const zh: LocaleDictOf<typeof NS> = {
   currentSession: '当前会话',
   currentSessionNote: '当前所在的会话不能包含在批量删除中。',
   toastDeleted: '已删除 {count} 个会话',
+  confirmBatch: '永久删除 {count} 个',
   toastFailed: '删除失败',
 }
 
