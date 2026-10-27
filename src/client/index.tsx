@@ -200,13 +200,13 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
     }
 
     const makeBox = (label: string): HTMLElement => {
-      const box = document.createElement('span')
+      const box = document.createElement('button')
+      box.type = 'button'
       box.className = 'dsh-srp-box'
       box.dataset.state = 'off'
-      box.setAttribute('role', 'checkbox')
       box.setAttribute('aria-checked', 'false')
       box.setAttribute('aria-label', label)
-      box.tabIndex = 0
+      box.textContent = ''
       return box
     }
 
