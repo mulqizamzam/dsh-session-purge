@@ -160,6 +160,8 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
       box.setAttribute('aria-checked', on ? 'true' : 'false')
     })
     wsBoxesRef.current.forEach((box, key) => {
+      // Placeholders for genuinely-empty workspaces have no sessions to sync.
+      if (box.dataset.empty === 'true') return
       const group = document.querySelector<HTMLElement>(`[data-row-key="${key}"]`)
         ?.closest('div[class*="groupSection"]')
       if (!group) return
@@ -199,7 +201,7 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
       return sessionRow
     }
 
-    const makeBox = (label: string): HTMLElement => {
+    const makeBox = (label: string): HTMLButtonElement => {
       const box = document.createElement('button')
       box.type = 'button'
       box.className = 'dsh-srp-box'
@@ -250,34 +252,91 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
       syncRef.current()
     }
 
-    const injectWorkspace = (row: HTMLElement): void => {
-      const key = row.dataset.rowKey
-      if (!key || !key.startsWith('workspace:')) return
-      if (row.querySelector(':scope > .dsh-srp-box')) return
-      const ids = sessionsOf(row)
-      if (ids.length === 0) return // no rendered sessions — skip
-      const box = makeBox('Select every session in this workspace')
+    /**
+     * Inject the workspace-level "select every session" box.
+     *
+     * Two cases must both end with a visible box so a workspace never looks
+     * like it is missing its checkbox:
+     * - sessions are already mounted -> enabled select-all box
+     * - no sessions mounted yet (React mounts the workspace row before its
+     *   children, or the workspace is genuinely empty) -> disabled placeholder
+     *   box. A later re-scan upgrades it in place once sessions appear, and
+     *   injectWorkspaces() is re-run after session insertions for that upgrade.
+     */
+    /** Attach event wiring that makes a workspace-select box functional.
+     *  Idempotent: safe to call after upgrade of a disabled placeholder. */
+    const wireWsBox = (box: HTMLButtonElement, row: HTMLElement): void => {
+      const update = (): void => syncRef.current()
       box.addEventListener('pointerdown', stop)
       box.addEventListener('mousedown', stop)
       box.addEventListener('click', event => {
         event.preventDefault()
         event.stopPropagation()
-        controller.toggleMany(ids)
+        controller.toggleMany(sessionsOf(row))
       })
       box.addEventListener('keydown', event => {
         if (event.key !== ' ' && event.key !== 'Enter') return
         event.preventDefault()
         event.stopPropagation()
-        controller.toggleMany(ids)
+        controller.toggleMany(sessionsOf(row))
       })
+
+    }
+
+    const injectWorkspace = (row: HTMLElement): void => {
+      const key = row.dataset.rowKey
+      if (!key || !key.startsWith('workspace:')) return
+      const ids = sessionsOf(row)
+      const existing = row.querySelector<HTMLButtonElement>(':scope > .dsh-srp-box')
+      if (existing) {
+        // Upgrade a placeholder in place; never duplicate a real box.
+        if (ids.length === 0 || existing.dataset.empty !== 'true') return
+        existing.dataset.empty = 'false'
+        existing.disabled = false
+        existing.removeAttribute('aria-disabled')
+        existing.setAttribute('aria-label', 'Select every session in this workspace')
+        existing.dataset.ids = ids.join(',')
+        // Re-wire so the upgraded box gets functional click/keydown handlers.
+        wireWsBox(existing, row)
+        syncRef.current()
+        return
+      }
+      // Only show a placeholder when the workspace is visibly expanded and
+      // still has zero session rows; a collapsed workspace may simply be
+      // waiting for its children to mount, and the post-mutation re-scan
+      // will create the real box once they appear.
+      if (ids.length === 0) {
+        if (row.getAttribute('aria-expanded') !== 'true') return
+        const placeholder = makeBox('No sessions in this workspace')
+        placeholder.dataset.empty = 'true'
+        placeholder.setAttribute('aria-disabled', 'true')
+        placeholder.disabled = true
+        // No click wiring on a disabled placeholder: it is inert by design.
+        placeholder.addEventListener('pointerdown', stop)
+        placeholder.addEventListener('mousedown', stop)
+        row.insertBefore(placeholder, row.firstChild)
+        wsBoxesRef.current.set(key, placeholder)
+        syncRef.current()
+        return
+      }
+      const box = makeBox('Select every session in this workspace')
+      box.dataset.ids = ids.join(',')
+      wireWsBox(box, row)
       row.insertBefore(box, row.firstChild)
       wsBoxesRef.current.set(key, box)
       syncRef.current()
     }
 
-    // Initial scan.
+    /** Re-scan every workspace row; the `:scope > .dsh-srp-box` guard keeps it idempotent. */
+    const injectWorkspaces = (): void => {
+      document.querySelectorAll<HTMLElement>('[data-row-key^="workspace:"]').forEach(injectWorkspace)
+    }
+
+    // Initial scan. Sessions first, then every workspace row: React can mount a
+    // workspace row before its session children, and the workspace pass is the
+    // only thing that upgrades the placeholder box afterwards.
     document.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(injectSession)
-    document.querySelectorAll<HTMLElement>('[data-row-key^="workspace:"]').forEach(injectWorkspace)
+    injectWorkspaces()
 
     // Collect all session rows for the batch dialog's availableRows.
     const allRows: SessionRow[] = []
@@ -297,6 +356,9 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
           node.querySelectorAll<HTMLElement>('[data-row-key^="session:"]').forEach(injectSession)
           node.querySelectorAll<HTMLElement>('[data-row-key^="workspace:"]').forEach(injectWorkspace)
         }
+        // Session rows may mount after their workspace row, so re-run the
+        // workspace pass after every batch of additions (idempotent via guard).
+        injectWorkspaces()
         for (const node of m.removedNodes) {
           if (!(node instanceof HTMLElement)) continue
           const key = node.dataset.rowKey
@@ -340,6 +402,7 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
       'border-bottom:2px solid #fff;transform:rotate(-45deg) translate(0,-1px);opacity:0}',
       '.dsh-srp-box[data-state="on"]::after{opacity:1}',
       '.dsh-srp-box[data-state="mixed"]::after{width:8px;height:2px;border:0;background:#fff;transform:none;opacity:1}',
+      '.dsh-srp-box[data-empty="true"]:not(:focus-visible){border-style:dashed;opacity:.45;cursor:not-allowed}',
     ].join('')
     document.head.appendChild(style)
     return () => { style.remove() }
