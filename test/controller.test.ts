@@ -143,20 +143,53 @@ describe('SessionPurgeController selection reconciliation', () => {
     expect(controller.getSnapshot().batch?.items.map(item => item.sessionId)).toEqual([wrappedId])
   })
 
-  it('matches bare and prefixed ids only for UI selection, but posts the original row id', async () => {
-    const prefixedId = ('session-' + ID) as SessionId
+  it('matches id casing for UI selection and posts the original row id', async () => {
+    const differentlyCasedId = ID.toUpperCase() as SessionId
     const controller = new SessionPurgeController(() => {})
-    controller.setAvailableRows([row(prefixedId)])
+    controller.setAvailableRows([row(differentlyCasedId)])
     controller.toggle(ID)
     controller.openBatchFromSelection()
-    expect(controller.getSnapshot().batch?.items.map(item => item.sessionId)).toEqual([prefixedId])
+    expect(controller.getSnapshot().batch?.items.map(item => item.sessionId)).toEqual([differentlyCasedId])
 
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => response({ ok: true, results: [{ ok: true }] }))
     vi.stubGlobal('fetch', fetchMock)
     await controller.confirm()
 
     const request = fetchMock.mock.calls[0]?.[1]
-    expect(JSON.parse(String(request?.body))).toEqual({ sessionIds: [prefixedId], confirm: true })
+    expect(JSON.parse(String(request?.body))).toEqual({ sessionIds: [differentlyCasedId], confirm: true })
+  })
+
+  it('does not treat a prefixed session id as its bare UUID in UI selection', () => {
+    const prefixedId = ('session-' + ID) as SessionId
+    const controller = new SessionPurgeController(() => {})
+    controller.setAvailableRows([row(prefixedId)])
+    controller.toggle(ID)
+    controller.openBatchFromSelection()
+
+    expect(controller.getSnapshot().batch).toBeNull()
+    expect(controller.getSnapshot().selected).toEqual([])
+    expect(controller.getSnapshot().error).toBe('selection-stale: selected sessions are no longer visible.')
+  })
+
+  it('toggleMany preserves bare and prefixed ids as distinct selections', () => {
+    const prefixedId = ('session-' + ID) as SessionId
+    const controller = new SessionPurgeController(() => {})
+    controller.toggleMany([ID, prefixedId])
+    expect(controller.getSnapshot().selected).toEqual([ID, prefixedId])
+
+    controller.toggleMany([ID])
+    expect(controller.getSnapshot().selected).toEqual([prefixedId])
+  })
+
+  it('selectAll selects and clears bare and prefixed ids independently', () => {
+    const prefixedId = ('session-' + ID) as SessionId
+    const rows = [row(ID), row(prefixedId)]
+    const controller = new SessionPurgeController(() => {})
+    controller.selectAll(rows)
+    expect(controller.getSnapshot().selected).toEqual([ID, prefixedId])
+
+    controller.selectAll(rows)
+    expect(controller.getSnapshot().selected).toEqual([])
   })
 
   it('ignores attempts to open either dialog while a delete is in flight', async () => {
