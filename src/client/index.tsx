@@ -97,6 +97,15 @@ const dangerButtonStyle: React.CSSProperties = {
   cursor: 'pointer',
 }
 
+function getSessionTitle(row: HTMLElement, fallback: string): string {
+  const titleEl = row.querySelector('[class*="title"]')
+    || row.querySelector('[data-slot="title"]')
+    || row.firstElementChild
+  return titleEl instanceof HTMLElement
+    ? titleEl.textContent?.trim() || fallback
+    : fallback
+}
+
 function HeaderAction({ sessionId, controller, t }: HeaderProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
   const selectedCount = state.selected.length
@@ -106,7 +115,15 @@ function HeaderAction({ sessionId, controller, t }: HeaderProps) {
       type="button"
       aria-label={label}
       title={label}
-      onClick={() => selectedCount > 0 ? controller.openBatchFromSelection() : controller.open(sessionId, '')}
+      onClick={() => {
+        if (selectedCount > 0) {
+          controller.openBatchFromSelection()
+          return
+        }
+        const row = document.querySelector<HTMLElement>(`[data-row-key="session:${String(sessionId)}"]`)
+        const title = row ? getSessionTitle(row, '') : ''
+        controller.open(sessionId, title || t('currentSession'))
+      }}
       style={selectedCount > 0 ? dangerButtonStyle : ghostButtonStyle}
     >
       {selectedCount > 0 ? `🗑 ${label}` : `🗑 ${t('delete')}`}
@@ -131,15 +148,30 @@ function FooterBatchButton({ controller, t }: FooterProps) {
   const selectedCount = state.selected.length
   const label = selectedCount > 0 ? t('deleteSelected', { count: selectedCount }) : t('selectMode')
   return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      onClick={() => controller.openBatchFromSelection()}
-      style={selectedCount > 0 ? dangerButtonStyle : ghostButtonStyle}
-    >
-      {selectedCount > 0 ? `🗑 ${label}` : `☑ ${label}`}
-    </button>
+    <>
+      <button
+        type="button"
+        aria-label={label}
+        title={label}
+        onClick={() => selectedCount > 0
+          ? controller.openBatchFromSelection()
+          : controller.selectAll(state.availableRows)}
+        style={selectedCount > 0 ? dangerButtonStyle : ghostButtonStyle}
+      >
+        {selectedCount > 0 ? `🗑 ${label}` : `☑ ${label}`}
+      </button>
+      {selectedCount > 0 && (
+        <button
+          type="button"
+          aria-label={t('clearSelection')}
+          title={t('clearSelection')}
+          onClick={() => controller.clearSelection()}
+          style={ghostButtonStyle}
+        >
+          {t('clearSelection')}
+        </button>
+      )}
+    </>
   )
 }
 
@@ -189,12 +221,7 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
       const idStr = key.replace('session:', '')
       const existing = rowsRef.current.get(key)
       if (existing) return existing
-      // Prefer a dedicated title element; fall back to first text-bearing child.
-      const titleEl = row.querySelector('[class*="title"]')
-        || row.querySelector('[data-slot="title"]')
-        || row.firstElementChild
-      const title = titleEl instanceof HTMLElement
-        ? titleEl.textContent?.trim() || idStr : idStr
+      const title = getSessionTitle(row, idStr)
       const sessionId = idStr as SessionId
       const sessionRow: SessionRow = { sessionId, title, running: false }
       rowsRef.current.set(key, sessionRow)
@@ -266,7 +293,6 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
     /** Attach event wiring that makes a workspace-select box functional.
      *  Idempotent: safe to call after upgrade of a disabled placeholder. */
     const wireWsBox = (box: HTMLButtonElement, row: HTMLElement): void => {
-      const update = (): void => syncRef.current()
       box.addEventListener('pointerdown', stop)
       box.addEventListener('mousedown', stop)
       box.addEventListener('click', event => {
@@ -349,6 +375,11 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
 
     const obs = new MutationObserver(mutations => {
       for (const m of mutations) {
+        if (m.type === 'attributes' && m.target instanceof HTMLElement
+          && m.target.dataset.rowKey?.startsWith('workspace:')) {
+          // verified manually: expanded workspace rows must receive their placeholder.
+          injectWorkspace(m.target)
+        }
         for (const node of m.addedNodes) {
           if (!(node instanceof HTMLElement)) continue
           if (node.dataset.rowKey?.startsWith('session:')) injectSession(node)
@@ -375,7 +406,12 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
       controller.setAvailableRows(updated)
       syncRef.current()
     })
-    obs.observe(document.body, { childList: true, subtree: true })
+    obs.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['aria-expanded'],
+    })
 
     return () => {
       obs.disconnect()
@@ -522,6 +558,7 @@ export function apply(ctx: ClientContext): void {
   })
 
   ctx.effect(() => ctx.locale.register(NS, { en, zh }), 'session-purge: dictionaries')
+  ctx.effect(() => () => controller.dispose(), 'session-purge: controller')
 
   ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
     name: 'conversation.session.header.utilities',
@@ -542,6 +579,14 @@ export function apply(ctx: ClientContext): void {
       selectedCount: controller.getSnapshot().selected.length,
     }),
   }, SidebarMenuItem))
+
+  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
+    name: 'sidebar.footer.action',
+    id: 'session-purge-footer',
+    order: 500,
+    locale: NS,
+    inject: () => ({ controller }),
+  }, FooterBatchButton))
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',

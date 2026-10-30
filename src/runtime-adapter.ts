@@ -187,7 +187,8 @@ export function createRuntimeAdapter(resolve: ServiceResolver): SessionPurgeRunt
       // delete() postcondition alone reported "verified" without observing
       // anything, so stat is preferred whenever the host exposes it.
       if (typeof persistence.stat === 'function') {
-        return await (persistence.stat as (id: string) => Promise<unknown>).call(persistence, id) === undefined
+        const snapshot = await (persistence.stat as (id: string) => Promise<unknown>).call(persistence, id)
+        return snapshot === undefined || snapshot === null
       }
       // Older-shaped providers: a successful delete() is itself a postcondition.
       if (typeof persistence.listSync !== 'function') return true

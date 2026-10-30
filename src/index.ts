@@ -59,16 +59,14 @@ function connectionOf(ctx: Context): ConnectionService {
 }
 
 /**
- * Authority of a Host header, normalized the way the host's own /api trust fence
- * normalizes it: parse the bare authority under `http:` (a WHATWG special scheme,
- * so the hostname survives and the parse throws on junk), which drops default
- * ports and keeps IPv6 literals bracketed. `undefined` means absent or
- * unparsable, and must fail closed.
+ * Authority of a Host header, normalized under the request Origin's scheme so
+ * WHATWG URL parsing drops only that scheme's default port and keeps IPv6
+ * literals bracketed. `undefined` means absent or unparsable, and must fail closed.
  */
-function hostAuthority(value: string | null): string | undefined {
+function hostAuthority(value: string | null, scheme: 'http:' | 'https:'): string | undefined {
   if (value === null) return undefined
   try {
-    return new URL(`http://${value.trim()}`).host
+    return new URL(`${scheme}//${value.trim()}`).host
   } catch {
     return undefined
   }
@@ -205,23 +203,22 @@ export function apply(ctx: Context): void {
       if (request.method !== 'POST') return json({ ok: false, error: 'method-not-allowed' }, 405)
       const origin = request.headers.get('origin')
       if (origin) {
-        // `request.url` cannot name this deployment's authority: the host bridges
-        // /api requests through packages/client/connection/src/http-bridge.ts,
-        // which rebuilds each URL against the synthetic base `http://dsh.internal`,
-        // so its origin is never the browser's. The Host header is the authority
-        // the browser actually dialed and the one the host's own /api trust fence
-        // binds, so compare the two hosts. Scheme is deliberately not compared:
-        // behind a TLS-terminating proxy the page origin is `https:` while the
-        // Host header it forwards carries no scheme, and the host fence accepts
-        // that same pair.
-        const authority = hostAuthority(request.headers.get('host'))
-        let originHost: string
+        // `request.url` is synthetic behind the host bridge, so Host carries the
+        // browser-facing authority. Parse that authority using the Origin scheme:
+        // this normalizes a forwarded explicit default port (443 for HTTPS, 80
+        // for HTTP) without accepting a non-default or cross-scheme port.
+        let originUrl: URL
         try {
-          originHost = new URL(origin).host
+          originUrl = new URL(origin)
         } catch {
           return json({ ok: false, error: 'invalid-origin' }, 403)
         }
-        if (authority === undefined || originHost !== authority) {
+        if (originUrl.protocol !== 'http:' && originUrl.protocol !== 'https:') {
+          return json({ ok: false, error: 'invalid-origin' }, 403)
+        }
+        const scheme: 'http:' | 'https:' = originUrl.protocol
+        const authority = hostAuthority(request.headers.get('host'), scheme)
+        if (authority === undefined || originUrl.host !== authority) {
           return json({ ok: false, error: 'cross-origin-request-rejected' }, 403)
         }
       }
@@ -236,11 +233,17 @@ export function apply(ctx: Context): void {
       }
       if (!body || typeof body !== 'object') return json({ ok: false, error: 'invalid-request' }, 400)
       const input = body as { sessionId?: unknown; sessionIds?: unknown; confirm?: unknown }
-      // Batch mode: sessionIds (array) + confirm
-      if (Array.isArray(input.sessionIds) && input.confirm === true) {
+      // Batch mode: sessionIds must be a string array + confirm.
+      if (input.sessionIds !== undefined) {
+        if (!Array.isArray(input.sessionIds) || !input.sessionIds.every((id: unknown) => typeof id === 'string')) {
+          return json({ ok: false, error: 'invalid-sessionIds' }, 400)
+        }
+        if (input.confirm !== true) {
+          return json({ ok: false, error: 'sessionId-and-confirm-true-required' }, 400)
+        }
         const ids = input.sessionIds as string[]
         if (ids.length === 0) return json({ ok: false, error: 'empty-sessionIds' }, 400)
-        const results = []
+        const results: { ok: boolean; id: string; error?: string; stage?: string }[] = []
         for (const id of ids) {
           try {
             const result = await purgeSession(runtime, id, request.signal, (error, stage) => {
@@ -249,12 +252,14 @@ export function apply(ctx: Context): void {
             if (result.log) announceRemoval(ctx, result.id)
             results.push(result)
           } catch (error) {
+            logUnexpected(ctx, error, 'route')
             results.push({ ok: false, id, error: publicErrorMessage(error), stage: 'route' })
           }
         }
         // Invalidate list cache once after all deletions
         try { await purgeSessionListCache(ctx) } catch { /* best-effort */ }
-        return json({ ok: true, results }, 200)
+        const allOk = results.every(result => result.ok)
+        return json({ ok: allOk, results }, allOk ? 200 : 207)
       }
       // Single mode: sessionId + confirm
       if (typeof input.sessionId !== 'string' || input.confirm !== true) {
