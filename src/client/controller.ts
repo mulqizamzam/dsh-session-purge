@@ -37,6 +37,12 @@ export interface PurgeUiState {
 
 type Listener = () => void
 
+// UI-only equivalence: this key must never be sent to the API or persistence.
+function selectionKey(id: SessionId): string {
+  const value = String(id).toLowerCase()
+  return value.startsWith('session-') ? value.slice(8) : value
+}
+
 export function nonEmptySessionTitle(title: string | null | undefined, fallback: string): string {
   return title?.trim() || fallback
 }
@@ -70,14 +76,14 @@ export class SessionPurgeController {
 
   /** Called by RowCheckboxInjector when rows are injected into DOM. */
   setAvailableRows(rows: readonly SessionRow[]): void {
-    const live = new Set(rows.map(row => String(row.sessionId)))
-    const selected = this.state.selected.filter(id => live.has(String(id)))
+    const live = new Set(rows.map(row => selectionKey(row.sessionId)))
+    const selected = this.state.selected.filter(id => live.has(selectionKey(id)))
     this.setState({ ...this.state, availableRows: rows, selected })
   }
 
   toggle(sessionId: SessionId): void {
-    const selected = this.state.selected.some(id => String(id) === String(sessionId))
-      ? this.state.selected.filter(id => String(id) !== String(sessionId))
+    const selected = this.state.selected.some(id => selectionKey(id) === selectionKey(sessionId))
+      ? this.state.selected.filter(id => selectionKey(id) !== selectionKey(sessionId))
       : [...this.state.selected, sessionId]
     this.setState({ ...this.state, selected })
   }
@@ -85,20 +91,20 @@ export class SessionPurgeController {
   /** Toggle all given session ids to the opposite of their current state (workspace checkbox). */
   toggleMany(sessionIds: readonly SessionId[]): void {
     if (sessionIds.length === 0) return
-    const current = new Set(this.state.selected.map(id => String(id)))
-    const allOn = sessionIds.every(id => current.has(String(id)))
-    const next = new Set<string>(current)
+    const current = new Set(this.state.selected.map(selectionKey))
+    const allOn = sessionIds.every(id => current.has(selectionKey(id)))
+    const next = new Map<string, SessionId>(this.state.selected.map(id => [selectionKey(id), id]))
     for (const id of sessionIds) {
-      if (allOn) next.delete(String(id))
-      else next.add(String(id))
+      if (allOn) next.delete(selectionKey(id))
+      else next.set(selectionKey(id), id)
     }
-    this.setState({ ...this.state, selected: [...next] as SessionId[] })
+    this.setState({ ...this.state, selected: [...next.values()] })
   }
 
   selectAll(rows: readonly SessionRow[]): void {
     const ids = rows.map(row => row.sessionId)
-    const selected = new Set(this.state.selected.map(id => String(id)))
-    const allSelected = ids.length > 0 && ids.every(id => selected.has(String(id)))
+    const selected = new Set(this.state.selected.map(selectionKey))
+    const allSelected = ids.length > 0 && ids.every(id => selected.has(selectionKey(id)))
     this.setState({
       ...this.state,
       selected: allSelected ? [] : ids,
@@ -115,8 +121,8 @@ export class SessionPurgeController {
     if (this.state.busy) return
     this.setToast(null)
     if (this.state.selected.length === 0) return
-    const selected = new Set(this.state.selected.map(id => String(id)))
-    const chosen = this.state.availableRows.filter(row => selected.has(String(row.sessionId)))
+    const selected = new Set(this.state.selected.map(selectionKey))
+    const chosen = this.state.availableRows.filter(row => selected.has(selectionKey(row.sessionId)))
     if (chosen.length === 0) {
       this.setState({
         ...this.state,
@@ -194,7 +200,7 @@ export class SessionPurgeController {
       }
       try { await this.refreshList() } catch { /* host events may still update the list */ }
       const sessionId = target.sessionId
-      const selected = this.state.selected.filter(id => String(id) !== String(sessionId))
+      const selected = this.state.selected.filter(id => selectionKey(id) !== selectionKey(sessionId))
       this.setState({
         ...this.state,
         target: null,
@@ -246,8 +252,8 @@ export class SessionPurgeController {
         }
       })
       try { await this.refreshList() } catch { /* host events may still update the list */ }
-      const succeededIds = new Set(succeeded.map(id => String(id)))
-      const remaining = this.state.selected.filter(id => !succeededIds.has(String(id)))
+      const succeededIds = new Set(succeeded.map(selectionKey))
+      const remaining = this.state.selected.filter(id => !succeededIds.has(selectionKey(id)))
       this.setState({
         ...this.state,
         batch: null,

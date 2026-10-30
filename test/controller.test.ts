@@ -143,6 +143,22 @@ describe('SessionPurgeController selection reconciliation', () => {
     expect(controller.getSnapshot().batch?.items.map(item => item.sessionId)).toEqual([wrappedId])
   })
 
+  it('matches bare and prefixed ids only for UI selection, but posts the original row id', async () => {
+    const prefixedId = ('session-' + ID) as SessionId
+    const controller = new SessionPurgeController(() => {})
+    controller.setAvailableRows([row(prefixedId)])
+    controller.toggle(ID)
+    controller.openBatchFromSelection()
+    expect(controller.getSnapshot().batch?.items.map(item => item.sessionId)).toEqual([prefixedId])
+
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => response({ ok: true, results: [{ ok: true }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await controller.confirm()
+
+    const request = fetchMock.mock.calls[0]?.[1]
+    expect(JSON.parse(String(request?.body))).toEqual({ sessionIds: [prefixedId], confirm: true })
+  })
+
   it('ignores attempts to open either dialog while a delete is in flight', async () => {
     let resolveFetch!: (value: Response) => void
     vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(resolve => {
