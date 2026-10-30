@@ -37,6 +37,15 @@ export interface PurgeUiState {
 
 type Listener = () => void
 
+// UI-only equivalence: this key must never be sent to the API or persistence.
+function selectionKey(id: SessionId): string {
+  return String(id).toLowerCase()
+}
+
+export function nonEmptySessionTitle(title: string | null | undefined, fallback: string): string {
+  return title?.trim() || fallback
+}
+
 export class SessionPurgeController {
   private state: PurgeUiState = {
     target: null,
@@ -50,6 +59,7 @@ export class SessionPurgeController {
   }
   private readonly listeners = new Set<Listener>()
   private nextToken = 1
+  private toastTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(private readonly refreshList: () => void | Promise<void>) {}
 
@@ -57,17 +67,22 @@ export class SessionPurgeController {
 
   readonly subscribe = (listener: Listener): (() => void) => {
     this.listeners.add(listener)
-    return () => this.listeners.delete(listener)
+    return () => {
+      this.listeners.delete(listener)
+      if (this.listeners.size === 0) this.setToast(null)
+    }
   }
 
   /** Called by RowCheckboxInjector when rows are injected into DOM. */
   setAvailableRows(rows: readonly SessionRow[]): void {
-    this.setState({ ...this.state, availableRows: rows })
+    const live = new Set(rows.map(row => selectionKey(row.sessionId)))
+    const selected = this.state.selected.filter(id => live.has(selectionKey(id)))
+    this.setState({ ...this.state, availableRows: rows, selected })
   }
 
   toggle(sessionId: SessionId): void {
-    const selected = this.state.selected.includes(sessionId)
-      ? this.state.selected.filter(id => id !== sessionId)
+    const selected = this.state.selected.some(id => selectionKey(id) === selectionKey(sessionId))
+      ? this.state.selected.filter(id => selectionKey(id) !== selectionKey(sessionId))
       : [...this.state.selected, sessionId]
     this.setState({ ...this.state, selected })
   }
@@ -75,19 +90,20 @@ export class SessionPurgeController {
   /** Toggle all given session ids to the opposite of their current state (workspace checkbox). */
   toggleMany(sessionIds: readonly SessionId[]): void {
     if (sessionIds.length === 0) return
-    const current = new Set(this.state.selected.map(id => String(id)))
-    const allOn = sessionIds.every(id => current.has(String(id)))
-    const next = new Set<string>(current)
+    const current = new Set(this.state.selected.map(selectionKey))
+    const allOn = sessionIds.every(id => current.has(selectionKey(id)))
+    const next = new Map<string, SessionId>(this.state.selected.map(id => [selectionKey(id), id]))
     for (const id of sessionIds) {
-      if (allOn) next.delete(String(id))
-      else next.add(String(id))
+      if (allOn) next.delete(selectionKey(id))
+      else next.set(selectionKey(id), id)
     }
-    this.setState({ ...this.state, selected: [...next] as SessionId[] })
+    this.setState({ ...this.state, selected: [...next.values()] })
   }
 
   selectAll(rows: readonly SessionRow[]): void {
-    const ids = rows.map(r => r.sessionId)
-    const allSelected = ids.length > 0 && ids.every(id => this.state.selected.includes(id))
+    const ids = rows.map(row => row.sessionId)
+    const selected = new Set(this.state.selected.map(selectionKey))
+    const allSelected = ids.length > 0 && ids.every(id => selected.has(selectionKey(id)))
     this.setState({
       ...this.state,
       selected: allSelected ? [] : ids,
@@ -101,9 +117,19 @@ export class SessionPurgeController {
 
   /** Open batch dialog with currently selected sessions from available rows. */
   openBatchFromSelection(): void {
+    if (this.state.busy) return
+    this.setToast(null)
     if (this.state.selected.length === 0) return
-    const chosen = this.state.availableRows.filter(r => this.state.selected.includes(r.sessionId))
-    if (chosen.length === 0) return
+    const selected = new Set(this.state.selected.map(selectionKey))
+    const chosen = this.state.availableRows.filter(row => selected.has(selectionKey(row.sessionId)))
+    if (chosen.length === 0) {
+      this.setState({
+        ...this.state,
+        selected: [],
+        error: 'selection-stale: selected sessions are no longer visible.',
+      })
+      return
+    }
     const token = this.nextToken++
     this.setState({
       ...this.state,
@@ -117,10 +143,13 @@ export class SessionPurgeController {
 
   closeBatch(): void {
     if (this.state.busy) return
+    this.setToast(null)
     this.setState({ ...this.state, batch: null, error: null, itemFailures: [] })
   }
 
   open(sessionId: SessionId, title: string): void {
+    if (this.state.busy) return
+    this.setToast(null)
     this.setState({
       ...this.state,
       target: { sessionId, title, token: this.nextToken++ },
@@ -133,7 +162,8 @@ export class SessionPurgeController {
 
   close(): void {
     if (this.state.busy) return
-    this.setState({ ...this.state, target: null, batch: null, busy: false, error: null, itemFailures: [], toast: null })
+    this.setToast(null)
+    this.setState({ ...this.state, target: null, batch: null, busy: false, error: null, itemFailures: [] })
   }
 
   async confirm(): Promise<void> {
@@ -149,7 +179,6 @@ export class SessionPurgeController {
   }
 
   private async confirmSingle(target: DeleteTarget): Promise<void> {
-    const { token } = target
     this.setState({ ...this.state, busy: true, error: null })
     try {
       const response = await fetch('/api/session-purge/delete', {
@@ -170,7 +199,7 @@ export class SessionPurgeController {
       }
       try { await this.refreshList() } catch { /* host events may still update the list */ }
       const sessionId = target.sessionId
-      const selected = this.state.selected.filter(id => id !== sessionId)
+      const selected = this.state.selected.filter(id => selectionKey(id) !== selectionKey(sessionId))
       this.setState({
         ...this.state,
         target: null,
@@ -179,8 +208,8 @@ export class SessionPurgeController {
         error: null,
         itemFailures: [],
         selected,
-        toast: '1 session deleted',
       })
+      this.setToast('1 session deleted')
     } catch (error) {
       this.setState({
         ...this.state,
@@ -191,7 +220,7 @@ export class SessionPurgeController {
   }
 
   private async confirmBatch(dialog: BatchDialog): Promise<void> {
-    const { token, items } = dialog
+    const { items } = dialog
     this.setState({ ...this.state, busy: true, error: null, itemFailures: [] })
     try {
       const response = await fetch('/api/session-purge/delete', {
@@ -222,7 +251,8 @@ export class SessionPurgeController {
         }
       })
       try { await this.refreshList() } catch { /* host events may still update the list */ }
-      const remaining = this.state.selected.filter(id => !succeeded.includes(id))
+      const succeededIds = new Set(succeeded.map(selectionKey))
+      const remaining = this.state.selected.filter(id => !succeededIds.has(selectionKey(id)))
       this.setState({
         ...this.state,
         batch: null,
@@ -235,9 +265,10 @@ export class SessionPurgeController {
             : null,
         itemFailures: failures,
         selected: remaining,
-        toast: failures.length === 0 ? `${succeeded.length} sessions deleted` : null,
       })
+      this.setToast(failures.length === 0 ? `${succeeded.length} sessions deleted` : null)
     } catch (error) {
+      this.setToast(null)
       this.setState({
         ...this.state,
         busy: false,
@@ -246,6 +277,22 @@ export class SessionPurgeController {
         error: error instanceof Error ? error.message : 'Session deletion failed.',
       })
     }
+  }
+
+  private setToast(message: string | null): void {
+    if (this.toastTimer !== null) {
+      clearTimeout(this.toastTimer)
+      this.toastTimer = null
+    }
+    this.setState({ ...this.state, toast: message })
+    if (message !== null) {
+      this.toastTimer = setTimeout(() => this.setToast(null), 4000)
+    }
+  }
+
+  dispose(): void {
+    this.setToast(null)
+    this.listeners.clear()
   }
 
   private setState(next: PurgeUiState): void {

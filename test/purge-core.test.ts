@@ -23,6 +23,9 @@ describe('normalizeSessionId', () => {
     expect(normalizeSessionId(`session-${ID}`)).toBe(`session-${ID}`)
     expect(normalizeSessionId(`  session-${ID.toUpperCase()}  `)).toBe(`session-${ID}`)
   })
+  it('normalizes an uppercase SESSION- prefix and UUID', () => {
+    expect(normalizeSessionId(`SESSION-${ID.toUpperCase()}`)).toBe(`session-${ID}`)
+  })
   it('rejects path-like or malformed ids', () => {
     expect(() => normalizeSessionId('../../sessions')).toThrow(/UUID/)
     expect(() => normalizeSessionId('session-../..')).toThrow(/UUID/)

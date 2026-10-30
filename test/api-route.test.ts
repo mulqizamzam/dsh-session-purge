@@ -77,7 +77,11 @@ interface Harness {
  * `apply` when the service already exists (measured), so requests issued after
  * this helper resolves see a fully captured resolver.
  */
-async function install(services?: Record<string, object>, webServerPort?: number): Promise<Harness> {
+async function install(
+  services?: Record<string, object>,
+  webServerPort?: number,
+  onRemoved?: () => void,
+): Promise<Harness> {
   const routes: RegisteredRoute[] = []
   const deleted: string[] = []
   const logs: string[] = []
@@ -108,6 +112,9 @@ async function install(services?: Record<string, object>, webServerPort?: number
       // which is how this plugin behaves on a host with no web surface.
       if (webServerPort !== undefined) {
         c.reflect.provide('webServer', { port: webServerPort, host: '127.0.0.1' })
+      }
+      if (onRemoved) {
+        c.on('api-session/removed' as never, (() => { onRemoved() }) as never)
       }
     },
   })
@@ -152,7 +159,16 @@ function deleteCapablePersistence(deleted: string[], deleteCalls?: { id: string;
 
 async function post(route: RegisteredRoute, body: unknown, headers: Record<string, string>) {
   const response = await route.fetch(browserRequest(body, headers))
-  return { status: response.status, payload: await response.json() as { ok?: boolean; log?: boolean; error?: string; stage?: string } }
+  return {
+    status: response.status,
+    payload: await response.json() as {
+      ok?: boolean
+      log?: boolean
+      error?: string
+      stage?: string
+      results?: { ok?: boolean; id?: string; error?: string; stage?: string }[]
+    },
+  }
 }
 
 let active: Harness[] = []
@@ -234,6 +250,21 @@ describe('POST /api/session-purge/delete origin gate', () => {
     expect(payload.ok).toBe(true)
   })
 
+  it('normalizes explicit default and non-default ports using the Origin scheme', async () => {
+    for (const [host, origin, expectedStatus] of [
+      ['dsg.example.com:443', 'https://dsg.example.com', 200],
+      ['dsg.example.com:80', 'http://dsg.example.com', 200],
+      ['dsg.example.com:8443', 'https://dsg.example.com', 403],
+      ['dsg.example.com:443', 'http://dsg.example.com', 403],
+    ] as const) {
+      const { routes } = await opened(deleteCapablePersistence([]))
+      const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, { host, origin })
+      expect(status).toBe(expectedStatus)
+      if (expectedStatus === 200) expect(payload.ok).toBe(true)
+      else expect(payload.error).toBe('cross-origin-request-rejected')
+    }
+  })
+
   it('rejects a foreign origin and deletes nothing', async () => {
     const deleted: string[] = []
     const { routes } = await opened(deleteCapablePersistence(deleted))
@@ -289,6 +320,49 @@ describe('POST /api/session-purge/delete origin gate', () => {
     })
     expect(status).toBe(400)
     expect(payload.error).toBe('sessionId-and-confirm-true-required')
+  })
+})
+
+describe('batch route outcomes and validation', () => {
+  it('returns 207 and ok false when every batch item fails', async () => {
+    const { routes } = await opened()
+    const { status, payload } = await post(routes[0], { sessionIds: [ID], confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(207)
+    expect(payload.ok).toBe(false)
+    expect(payload.results?.map(result => result.ok)).toEqual([false])
+  })
+
+  it('logs unexpected exceptions escaping a batch item at route stage', async () => {
+    const deleted: string[] = []
+    const harness = await install(deleteCapablePersistence(deleted), undefined, () => {
+      throw new Error('removal listener exploded')
+    })
+    active.push(harness)
+    const { status, payload } = await post(harness.routes[0], { sessionIds: [ID], confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(207)
+    expect(payload.ok).toBe(false)
+    expect(payload.results?.[0]?.stage).toBe('route')
+    expect(harness.logs.some(line => line.includes('session-purge: unexpected failure at route'))).toBe(true)
+    expect(harness.logs.some(line => line.includes('removal listener exploded'))).toBe(true)
+    expect(deleted).toEqual([ID])
+  })
+
+  it('rejects non-string or non-array sessionIds with invalid-sessionIds', async () => {
+    for (const sessionIds of ['not-an-array', [ID, 7], null]) {
+      const { routes } = await opened()
+      const { status, payload } = await post(routes[0], { sessionIds, confirm: true }, {
+        host: '127.0.0.1:13080',
+        origin: 'http://127.0.0.1:13080',
+      })
+      expect(status).toBe(400)
+      expect(payload.error).toBe('invalid-sessionIds')
+    }
   })
 })
 
@@ -397,6 +471,34 @@ describe('host API shapes the adapter must call correctly', () => {
     expect(deleted).toEqual([ID])
     expect(cachePurged).toEqual([])
     expect(ledgerReleased).toEqual([])
+  })
+})
+
+describe('the persistence stat absence contract', () => {
+  it('treats null from stat as absent and runs cache and ledger cleanup', async () => {
+    const deleted: string[] = []
+    const cachePurged: string[] = []
+    const ledgerReleased: string[] = []
+    const services = deleteCapablePersistence(deleted)
+    ;(services.sessionPersistence as { stat: (id: string) => Promise<unknown> }).stat = async () => null
+    ;(services.sessionProjectionCache as { purge: (id: string) => Promise<boolean> }).purge = async id => {
+      cachePurged.push(id)
+      return true
+    }
+    ;(services.workspaceRegistry as { releaseSession: (id: string) => Promise<void> }).releaseSession = async id => {
+      ledgerReleased.push(id)
+    }
+    const { routes } = await opened(services)
+    const { status, payload } = await post(routes[0], { sessionId: ID, confirm: true }, {
+      host: '127.0.0.1:13080',
+      origin: 'http://127.0.0.1:13080',
+    })
+    expect(status).toBe(200)
+    expect(payload.ok).toBe(true)
+    expect(payload.log).toBe(true)
+    expect(deleted).toEqual([ID])
+    expect(cachePurged).toEqual([ID])
+    expect(ledgerReleased).toEqual([ID])
   })
 })
 

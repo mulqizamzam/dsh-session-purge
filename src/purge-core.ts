@@ -69,7 +69,8 @@ export class SessionPurgeError extends Error {
  */
 export function normalizeSessionId(raw: string): string {
   const trimmed = raw.trim()
-  const bare = trimmed.startsWith('session-') ? trimmed.slice('session-'.length) : trimmed
+  const lower = trimmed.toLowerCase()
+  const bare = lower.startsWith('session-') ? lower.slice('session-'.length) : lower
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
   if (!uuid.test(bare)) {
     throw new SessionPurgeError(
@@ -78,7 +79,7 @@ export function normalizeSessionId(raw: string): string {
       'sessionId must be a UUID, optionally prefixed with "session-".',
     )
   }
-  return trimmed.toLowerCase()
+  return lower
 }
 
 function messageOf(error: unknown): string {
