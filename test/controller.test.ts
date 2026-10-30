@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { SessionPurgeController, type SessionRow } from '../src/client/controller.ts'
+import { nonEmptySessionTitle, SessionPurgeController, type SessionRow } from '../src/client/controller.ts'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
 const ID = '2de8b71d-bd3b-4f4d-8d1d-5dceac76f934' as SessionId
@@ -47,6 +47,15 @@ describe('SessionPurgeController toast lifecycle', () => {
     controller.open(ID2, 'Another session')
     expect(controller.getSnapshot().toast).toBeNull()
     expect(vi.getTimerCount()).toBe(0)
+
+    await controller.confirm()
+    expect(controller.getSnapshot().toast).toBe('1 session deleted')
+    controller.setAvailableRows([row(ID)])
+    controller.toggle(ID)
+    controller.openBatchFromSelection()
+    expect(controller.getSnapshot().toast).toBeNull()
+    expect(controller.getSnapshot().batch?.items).toHaveLength(1)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('two consecutive toasts do not stack (second replaces first and re-arms timer)', async () => {
@@ -71,6 +80,18 @@ describe('SessionPurgeController toast lifecycle', () => {
     expect(controller.getSnapshot().toast).toBeNull()
   })
 
+  it('dispose clears the pending toast timer', async () => {
+    vi.useFakeTimers()
+    mockFetch({ ok: true })
+    const controller = new SessionPurgeController(() => {})
+    controller.open(ID, 'Session')
+    await controller.confirm()
+    expect(vi.getTimerCount()).toBe(1)
+    controller.dispose()
+    expect(controller.getSnapshot().toast).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('unsubscribing the last listener clears the pending toast timer', async () => {
     vi.useFakeTimers()
     mockFetch({ ok: true })
@@ -82,6 +103,15 @@ describe('SessionPurgeController toast lifecycle', () => {
     unsubscribe()
     expect(controller.getSnapshot().toast).toBeNull()
     expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+describe('header title fallback', () => {
+  it('never resolves a missing or blank header title to an empty string', () => {
+    expect(nonEmptySessionTitle('', 'current session')).toBe('current session')
+    expect(nonEmptySessionTitle('   ', 'current session')).toBe('current session')
+    expect(nonEmptySessionTitle(undefined, 'current session')).toBe('current session')
+    expect(nonEmptySessionTitle('Project Alpha', 'current session')).toBe('Project Alpha')
   })
 })
 

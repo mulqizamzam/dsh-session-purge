@@ -9,7 +9,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import { MenuItemButton, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, LocaleDictOf, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { SessionPurgeController, type SessionRow } from './controller.ts'
+import { nonEmptySessionTitle, SessionPurgeController, type SessionRow } from './controller.ts'
 
 const NS = 'session-purge'
 type LocaleKey =
@@ -102,7 +102,7 @@ function getSessionTitle(row: HTMLElement, fallback: string): string {
     || row.querySelector('[data-slot="title"]')
     || row.firstElementChild
   return titleEl instanceof HTMLElement
-    ? titleEl.textContent?.trim() || fallback
+    ? nonEmptySessionTitle(titleEl.textContent, fallback)
     : fallback
 }
 
@@ -122,7 +122,7 @@ function HeaderAction({ sessionId, controller, t }: HeaderProps) {
         }
         const row = document.querySelector<HTMLElement>(`[data-row-key="session:${String(sessionId)}"]`)
         const title = row ? getSessionTitle(row, '') : ''
-        controller.open(sessionId, title || t('currentSession'))
+        controller.open(sessionId, nonEmptySessionTitle(title, t('currentSession')))
       }}
       style={selectedCount > 0 ? dangerButtonStyle : ghostButtonStyle}
     >

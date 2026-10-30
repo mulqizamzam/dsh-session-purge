@@ -37,6 +37,10 @@ export interface PurgeUiState {
 
 type Listener = () => void
 
+export function nonEmptySessionTitle(title: string | null | undefined, fallback: string): string {
+  return title?.trim() || fallback
+}
+
 export class SessionPurgeController {
   private state: PurgeUiState = {
     target: null,
