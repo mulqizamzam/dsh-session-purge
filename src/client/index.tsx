@@ -377,7 +377,7 @@ function RowCheckboxInjector({ controller }: OverlayProps) {
       for (const m of mutations) {
         if (m.type === 'attributes' && m.target instanceof HTMLElement
           && m.target.dataset.rowKey?.startsWith('workspace:')) {
-          // verified manually: expanded workspace rows must receive their placeholder.
+          // manual-verify (browser/runtime): expanding an initially empty workspace must show a placeholder; mounting session rows must upgrade it.
           injectWorkspace(m.target)
         }
         for (const node of m.addedNodes) {
