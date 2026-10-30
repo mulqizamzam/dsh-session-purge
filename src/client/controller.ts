@@ -39,8 +39,7 @@ type Listener = () => void
 
 // UI-only equivalence: this key must never be sent to the API or persistence.
 function selectionKey(id: SessionId): string {
-  const value = String(id).toLowerCase()
-  return value.startsWith('session-') ? value.slice(8) : value
+  return String(id).toLowerCase()
 }
 
 export function nonEmptySessionTitle(title: string | null | undefined, fallback: string): string {
